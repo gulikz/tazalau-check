@@ -1,12 +1,13 @@
-/* Tazalau помощник: версия 2.
+/* Tazalau помощник: версия 3.
    Закладка для tazalau.qoldau.kz (Edge или Chrome). Ничего не устанавливает.
    По файлу Excel (столбец «ИИН/БИН»): открывает реестр с фильтром по ИИН, проверяет, что на странице
    именно результат поиска, сохраняет снимок страницы и пишет ссылку на него в столбец tazalau_file_location.
-   Снимок каждого человека лежит в своей папке с именем из столбца FIO и называется «снимок.png».
+   Снимок каждого человека лежит рядом с файлом Excel в своей папке с именем из столбца FIO и называется «снимок.png».
+   В столбец hyperlink пишется полная ссылка: путь к папке на диске + папка человека + «снимок.png».
    Вход на сайт и ЭЦП не нужны. Файл Excel читается и изменяется только внутри браузера и никуда не отправляется. */
 (() => {
   'use strict';
-  const VERSION = '2';
+  const VERSION = '3';
   if (window.__tazalau) { window.__tazalau.show(); return; }
   if (!/(^|\.)tazalau\.qoldau\.kz$/i.test(location.hostname)) {
     const check = document.getElementById('tazalau-check');
@@ -47,6 +48,7 @@
     BACKOFF: [3000, 10000, 30000],     /* паузы перед повтором страницы */
     LIMIT_PAUSE: 20000,                /* сколько ждать после «Превышен лимит запросов» */
     SAVE_EVERY: 20,                    /* сохранять Excel каждые столько ИИН (режим папки) */
+    SETTLE: 80,                        /* пауза между проходами отрисовки снимка, мс: за неё браузер подключает шрифты */
   }, window.__tazalauTest || {});      /* автоматические проверки укорачивают паузы; в работе не используется */
   const RETRIES = 3;                   /* попыток на одну страницу */
   const LIMIT_RETRIES = 5;
@@ -55,14 +57,18 @@
   const SCAN_ROWS = 30;                /* в скольких верхних строках искать заголовок «ИИН/БИН» */
   const LINK_HEADER = 'tazalau_file_location';
   const RESULT_HEADER = 'tazalau_result';
-  const SHOTS_DIR = 'tazalau_screenshots';
+  const ABS_HEADER = 'hyperlink';      /* полная ссылка: путь к папке на диске + папка человека + снимок */
   const SHOT_NAME = 'снимок.png';      /* так называется снимок в папке каждого человека */
-  const BACKUP_DIR = 'tazalau_backup';
+  const BACKUP_DIR = 'tazalau_backup'; /* копии файла Excel перед записью и журналы проверок */
+  const WIN_PATH = 259;                /* путь к файлу длиннее этого Проводник и Excel не открывают */
+  const SWAP = 7;                      /* браузер пишет файл через временный «имя.crswap»: запас на его имя */
+  const PATH_FILE = 'путь_к_папке.txt';    /* в папке tazalau_backup: путь к папке на диске, вставленный вручную */
   /* ========================================================= */
 
   const START_URL = location.origin + REGISTRIES[0].path;
   const IIN_HEADERS = ['иин/бин', 'бин/иин', 'иин', 'iin/bin', 'iin'];
   const FIO_HEADERS = ['fio', 'фио', 'fullname', 'full_name'];     /* столбец с именем человека: из него имя папки */
+  const ABS_HEADERS = [ABS_HEADER, 'гиперссылка'];
   const COLORS = { 'НАЙДЕН': '#1a7f37', 'НЕ НАЙДЕН': '#1d2433', 'ОШИБКА': '#cf222e', 'НЕВЕРНЫЙ ИИН': '#b35900' };
 
   /* Таймер в отдельном потоке (Worker): если окно свёрнуто или закрыто другими окнами, браузер
@@ -282,6 +288,26 @@
   };
   const escTarget = s => s.replace(/%/g, '%25').replace(/#/g, '%23').replace(/ /g, '%20');
 
+  /* Путь к папке на диске в том виде, как его вставили: без кавычек и невидимых знаков, с обратными чертами.
+     Вставили путь к самому файлу Excel: берётся его папка. Адрес вида file:/// тоже понимается. */
+  function normBase(v) {
+    let s = String(v == null ? '' : v).replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '').trim()
+      .replace(/^"+|"+$/g, '').trim();
+    if (/^file:\/\//i.test(s)) {
+      s = s.replace(/^file:\/+/i, '');
+      try { s = decodeURIComponent(s); } catch (e) { /* оставляем как есть */ }
+      if (!/^[a-z]:/i.test(s)) s = '\\\\' + s;
+    }
+    s = s.replace(/\//g, '\\');
+    s = s.slice(0, 2) + s.slice(2).replace(/\\{2,}/g, '\\');
+    return s.replace(/\\[^\\]+\.xls[xmb]?$/i, '').replace(/\\+$/, '');
+  }
+  const baseValid = s => /^[a-z]:(\\[^\\/:*?"<>|]+)*$/i.test(s) || /^\\\\[^\\/:*?"<>|]+(\\[^\\/:*?"<>|]+)+$/.test(s);
+  const lastPart = s => s.slice(s.lastIndexOf('\\') + 1);
+  const sameName = (a, b) => String(a).normalize('NFC').toLowerCase() === String(b).normalize('NFC').toLowerCase();
+  /* Сколько знаков остаётся на имя папки человека, чтобы путь к снимку (и к прежнему снимку с номером) открывался в Windows */
+  const folderRoom = base => Math.min(100, WIN_PATH - SWAP - base.length - 2 - (SHOT_NAME.length + 3));
+
   async function openBook(bytes, fileName) {
     if (/\.xlsb$/i.test(fileName)) throw new Error('формат .xlsb не подходит: сохраните файл как .xlsx');
     if (bytes[0] === 0xd0 && bytes[1] === 0xcf) {
@@ -314,6 +340,8 @@
     }).filter(Boolean);
     const view = all(wb, 'workbookView')[0];
     book.active = view ? Number(view.getAttribute('activeTab') || 0) : 0;
+    const abs = all(wb, 'absPath')[0];            /* Excel записывает в файл папку, где его сохранили */
+    book.absPath = abs ? abs.getAttribute('url') || '' : '';
     return book;
   }
 
@@ -370,11 +398,12 @@
       }
     }
     if (!best) return null;
-    const L = { headerRow: best.row, iinCol: best.col, fioCol: 0, linkCol: 0, resultCol: 0, lastRow: best.row };
+    const L = { headerRow: best.row, iinCol: best.col, fioCol: 0, linkCol: 0, absCol: 0, resultCol: 0, lastRow: best.row };
     for (const [c, el] of S.cells.get(best.row)) {
       const x = cellValue(S, el), name = x && x.v != null ? normHead(x.v) : '';
       if (name === LINK_HEADER && (!L.linkCol || c < L.linkCol)) L.linkCol = c;
       if (name === RESULT_HEADER && (!L.resultCol || c < L.resultCol)) L.resultCol = c;
+      if (ABS_HEADERS.includes(name) && (!L.absCol || c < L.absCol)) L.absCol = c;
       if (FIO_HEADERS.includes(name.replace(/\./g, '')) && (!L.fioCol || c < L.fioCol)) L.fioCol = c;
     }
     for (const [r, map] of S.cells) {
@@ -458,13 +487,11 @@
     return S.rels;
   }
 
-  async function setLink(S, r, col, target) {
-    const rels = await sheetRels(S), ref = colName(col) + r, root = S.doc.documentElement;
-    let hl = kids(root, 'hyperlinks')[0];
-    if (!hl) {
-      hl = S.doc.createElementNS(NS, 'hyperlinks');
-      root.insertBefore(hl, Array.from(root.children).find(c => AFTER_LINKS.includes(c.localName)) || null);
-    }
+  /* Прежняя ссылка ячейки (если была) убирается вместе с её адресом */
+  async function dropLink(S, r, col) {
+    const ref = colName(col) + r, hl = kids(S.doc.documentElement, 'hyperlinks')[0];
+    if (!hl || !kids(hl, 'hyperlink').some(h => h.getAttribute('ref') === ref)) return;
+    const rels = await sheetRels(S);
     for (const h of kids(hl, 'hyperlink')) {
       if (h.getAttribute('ref') !== ref) continue;
       const old = h.getAttributeNS(RNS, 'id');
@@ -472,6 +499,19 @@
       if (old && !kids(hl, 'hyperlink').some(x => x.getAttributeNS(RNS, 'id') === old)) {
         all(rels, 'Relationship').filter(x => x.getAttribute('Id') === old && x.getAttribute('Type') === HYPERLINK_TYPE).forEach(x => x.remove());
       }
+    }
+    if (!kids(hl, 'hyperlink').length) hl.remove();          /* пустой список ссылок Excel считает ошибкой */
+    S.linkRanges = S.linkRanges.filter(g => !(g.c1 === col && g.c2 === col && g.r1 === r && g.r2 === r));
+    S.dirty = true;
+  }
+
+  async function setLink(S, r, col, target) {
+    await dropLink(S, r, col);
+    const rels = await sheetRels(S), ref = colName(col) + r, root = S.doc.documentElement;
+    let hl = kids(root, 'hyperlinks')[0];
+    if (!hl) {
+      hl = S.doc.createElementNS(NS, 'hyperlinks');
+      root.insertBefore(hl, Array.from(root.children).find(c => AFTER_LINKS.includes(c.localName)) || null);
     }
     const id = 'rId' + (++S.relNo);
     const h = S.doc.createElementNS(NS, 'hyperlink');
@@ -488,15 +528,34 @@
     S.dirty = true;
   }
 
-  /* Вид ссылки (синяя, подчёркнутая) поверх прежнего оформления ячейки: заливка и рамки остаются */
-  async function linkStyle(S, s) {
+  /* Полная ссылка записывается формулой =HYPERLINK("путь"): обычную ссылку на файл того же диска Excel при
+     сохранении книги переделывает в относительную, и после переноса или отправки книги она перестаёт открываться.
+     Формула остаётся как есть и всегда ведёт по полному пути. В ячейке виден сам путь. */
+  async function setPathLink(S, r, col, path, style) {
+    if (mergedInto(S, r, col)) throw new Error('строка ' + r + ': ячейка ' + colName(col) + r + ' объединена с соседними');
+    await dropLink(S, r, col);
+    const c = cellEl(S, r, col);
+    while (c.firstChild) c.firstChild.remove();
+    c.setAttribute('t', 'str');
+    if (style != null) c.setAttribute('s', style);
+    const f = S.doc.createElementNS(NS, 'f'), v = S.doc.createElementNS(NS, 'v');
+    f.textContent = 'HYPERLINK("' + path.replace(/"/g, '""') + '")';
+    v.textContent = path;
+    c.append(f, v);
+    S.dirty = true;
+    return c;
+  }
+
+  /* Вид ссылки (синяя, подчёркнутая) поверх прежнего оформления ячейки: заливка и рамки остаются.
+     general: числовой формат «Общий» (в ячейке с форматом «Текст» формула при правке превратилась бы в текст). */
+  async function linkStyle(S, s, general) {
     const book = S.book;
     if (book.styles === undefined) {
       const text = book.stylesPath ? await book.text(book.stylesPath) : null;
       book.styles = text ? parseXml(text, 'styles') : null;
       book.linkXf = new Map();
     }
-    const st = book.styles, key = s == null ? '' : String(s);
+    const st = book.styles, key = (general ? 'g' : '') + (s == null ? '' : String(s));
     if (!st) return s;
     if (book.linkXf.has(key)) return book.linkXf.get(key);
     const fonts = kids(st.documentElement, 'fonts')[0], xfs = kids(st.documentElement, 'cellXfs')[0];
@@ -515,6 +574,7 @@
     const nxf = xf.cloneNode(true);
     nxf.setAttribute('fontId', fontList.length);
     nxf.setAttribute('applyFont', '1');
+    if (general) { nxf.setAttribute('numFmtId', '0'); nxf.removeAttribute('applyNumberFormat'); }
     xfs.appendChild(nxf);
     xfs.setAttribute('count', xfList.length + 1);
     book.stylesDirty = true;
@@ -523,7 +583,7 @@
   }
 
   /* Недостающие столбцы программы: сразу за таблицей (объединённые ячейки шапки тоже считаются шапкой) */
-  function ensureColumns(S) {
+  function ensureColumns(S, withAbs) {
     const L = S.layout;
     const used = new Set();
     let last = L.iinCol;
@@ -536,7 +596,7 @@
     for (const g of S.merges) if (g.r1 <= L.headerRow && g.r2 >= L.headerRow) last = Math.max(last, g.c2);
     const headStyle = ((S.cells.get(L.headerRow) || new Map()).get(L.iinCol) || { getAttribute: () => null }).getAttribute('s');
     const add = (name, width) => {
-      let col = Math.max(last, L.linkCol || 0, L.resultCol || 0) + 1;
+      let col = Math.max(last, L.linkCol || 0, L.absCol || 0, L.resultCol || 0) + 1;
       while (used.has(col)) col++;
       setText(S, L.headerRow, col, name, headStyle);
       used.add(col);
@@ -544,6 +604,7 @@
       return col;
     };
     if (!L.linkCol) L.linkCol = add(LINK_HEADER, 60);
+    if (withAbs && !L.absCol) L.absCol = add(ABS_HEADER, 60);
     if (!L.resultCol) L.resultCol = add(RESULT_HEADER, 46);
   }
   function setWidth(S, col, width) {
@@ -626,7 +687,7 @@
 
   const canPickFolder = typeof window.showDirectoryPicker === 'function';
   const folderB = button('📁 Папка с Excel', pickFolder, true,
-    'Папка, где лежит файл Excel. Снимки сохранятся в ней же, ссылки запишутся прямо в файл.');
+    'Папка, где лежит файл Excel. В ней же появятся папки людей со снимками, ссылки запишутся прямо в файл.');
   const fileSelect = h('select', 'display:none;width:100%;margin:0 0 4px;font-size:12px');
   fileSelect.addEventListener('change', () => openFromFolder(fileSelect.value));
   const fileInput = h('input', 'display:none;width:100%;font-size:12px;margin:4px 0');
@@ -643,6 +704,24 @@
   const sheetSelect = h('select', 'display:none;width:100%;margin:0 0 4px;font-size:12px');
   sheetSelect.title = 'Лист со столбцом «ИИН/БИН»';
   sheetSelect.addEventListener('change', () => useSheet(sheetSelect.value));
+
+  /* Путь к выбранной папке на диске. Браузер его не сообщает, а для полной ссылки (столбец hyperlink) он нужен.
+     Берётся из самого файла Excel (Excel записывает туда папку, где файл сохранили) или вставляется сюда один раз. */
+  const baseBox = h('div', 'display:none;margin:2px 0 6px;font-size:12px');
+  const baseInput = h('textarea', 'display:block;width:100%;height:34px;box-sizing:border-box;margin:2px 0;padding:4px;' +
+    'font:11px/1.3 Arial,sans-serif;color:#1d2433;background:#fff;border:1px solid #b9c3d3;border-radius:4px;' +
+    'resize:vertical;word-break:break-all');
+  baseInput.id = 'tazalau-base';
+  baseInput.spellcheck = false;
+  baseInput.placeholder = 'W:\\Отдел\\Папка';
+  baseInput.title = 'Откройте эту папку в Проводнике, щёлкните по адресной строке, скопируйте путь и вставьте сюда';
+  const baseNote = h('div', 'white-space:pre-line');
+  baseNote.id = 'tazalau-base-state';
+  const baseAutoB = h('a', 'display:none;color:#1f6feb;cursor:pointer', 'Взять путь из файла Excel');
+  baseBox.append(h('div', 'color:#5b6577', 'Путь к этой папке на диске (для столбца ' + ABS_HEADER + '):'), baseInput, baseNote, baseAutoB);
+  baseInput.addEventListener('input', () => refresh());
+  baseInput.addEventListener('change', () => { baseInput.value = normBase(baseInput.value); refresh(); });
+  baseAutoB.addEventListener('click', () => { baseInput.value = baseAuto; refresh(); });
 
   const summary = h('div', 'margin:6px 0;white-space:pre-line;font-size:12px');
   const badBox = h('details', 'display:none;margin:0 0 6px;color:#9a3412;font-size:12px');
@@ -687,7 +766,7 @@
   const table = h('div', 'max-height:45vh;overflow:auto');
   jbox.append(jhead, table);
 
-  panel.append(head, banner, row(folderB), fileSelect, row(fileLink), fileInput, sheetSelect, summary, badBox, regBox,
+  panel.append(head, banner, row(folderB), fileSelect, row(fileLink), fileInput, sheetSelect, baseBox, summary, badBox, regBox,
     row(startB, stopB), state, row(csvB, xlsxB), jbox);
   document.body.appendChild(root);
   const overflowBefore = document.documentElement.style.overflow;
@@ -696,8 +775,9 @@
   window.addEventListener('beforeunload', e => { if (running) { e.preventDefault(); e.returnValue = ''; } });
 
   /* ---------- состояние ---------- */
-  let book = null, S = null, tasks = [], store = { dir: null, shots: null, handle: null };
+  let book = null, S = null, tasks = [], store = { dir: null, handle: null };
   let running = false, stopping = false, interval = T.INTERVAL, lastRequest = 0;
+  let baseAuto = '';                   /* путь к выбранной папке, найденный в самом файле Excel */
   const journal = [];
 
   function say(msg) { state.textContent = msg; }
@@ -723,23 +803,95 @@
     const t = clean(String(v || '').replace(/[\\/:*?"<>|#%\u0000-\u001f]/g, ' ')).slice(0, 100).replace(/[. ]+$/, '');
     return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(t) ? '_' + t : t;
   };
-  function folderNames() {
+  const cutName = (name, n) => (n > 0 ? name.slice(0, n).replace(/[. ]+$/, '') : '');
+  /* maxLen: сколько знаков можно отдать имени папки (путь к папке на диске длинный: имя укорачивается) */
+  function folderNames(maxLen) {
     const fio = new Map(), count = new Map(), out = new Map();
-    for (const t of tasks) if (t.parse.iin && !fio.get(t.parse.iin)) fio.set(t.parse.iin, safeName(t.fio));
+    for (const t of tasks) if (t.parse.iin && !fio.get(t.parse.iin)) fio.set(t.parse.iin, cutName(safeName(t.fio), maxLen));
     for (const [iin, name] of fio) { const key = (name || iin).toLowerCase(); count.set(key, (count.get(key) || 0) + 1); }
-    for (const [iin, name] of fio) out.set(iin, !name ? iin : count.get(name.toLowerCase()) > 1 ? name + ' ' + iin : name);
+    for (const [iin, name] of fio) {
+      out.set(iin, !name ? iin : count.get(name.toLowerCase()) > 1 ? (cutName(name, maxLen - iin.length - 1) + ' ' + iin).trim() : name);
+    }
     return out;
   }
-  /* Прежний снимок не затирается: получает дату в имени, а «снимок.png» всегда самый свежий */
-  async function keepOld(dir) {
+  /* Прежний снимок не затирается: получает дату в имени, а «снимок.png» всегда самый свежий.
+     room: сколько знаков можно отдать имени файла; если имя с датой не помещается в путь Windows, берётся короткое с номером. */
+  async function keepOld(dir, room) {
     let old;
     try { old = await (await dir.getFileHandle(SHOT_NAME)).getFile(); } catch (e) { return; }
-    await writeFile(dir, SHOT_NAME.replace(/\.png$/, '_' + stampOf(new Date(old.lastModified)) + '.png'), await old.arrayBuffer());
+    const data = await old.arrayBuffer();
+    const dated = SHOT_NAME.replace(/\.png$/, '_' + stampOf(new Date(old.lastModified)) + '.png');
+    if (dated.length <= room) {
+      try { await writeFile(dir, dated, data); return; }
+      catch (e) { try { await dir.removeEntry(dated); } catch (x) { /* не создан */ } }
+    }
+    for (let n = 1; n < 100; n++) {
+      const name = SHOT_NAME.replace(/\.png$/, '_' + n + '.png');
+      try { await dir.getFileHandle(name); continue; } catch (e) { /* имя свободно */ }
+      await writeFile(dir, name, data);
+      return;
+    }
+    throw new Error('в папке уже 99 прежних снимков');
+  }
+
+  /* Путь к папке, вставленный вручную, помощник помнит в самой папке: файл «путь_к_папке.txt» в tazalau_backup.
+     Так путь не остаётся в браузере (хранилище браузера читает и сам сайт) и общий для всех, кто работает в этой папке.
+     В файле путь или слово «нет» (на вопрос ответили «без hyperlink», больше не спрашивать). */
+  async function readSaved() {
+    try {
+      const dir = await store.dir.getDirectoryHandle(BACKUP_DIR);
+      const text = await (await (await dir.getFileHandle(PATH_FILE)).getFile()).text();
+      const line = text.replace(/^\ufeff/, '').split(/\r?\n/)[0].trim();
+      return /^нет$/i.test(line) ? '' : normBase(line) || undefined;
+    } catch (e) { return undefined; }
+  }
+  /* v: путь, '' (без hyperlink) или null (забыть: путь снова берётся из файла Excel) */
+  async function writeSaved(v) {
+    try {
+      if (v == null) {
+        if (store.saved === undefined) return;
+        await (await store.dir.getDirectoryHandle(BACKUP_DIR)).removeEntry(PATH_FILE);
+      } else {
+        if (store.saved === v) return;
+        const dir = await store.dir.getDirectoryHandle(BACKUP_DIR, { create: true });
+        await writeFile(dir, PATH_FILE, new Blob([(v || 'нет') + '\r\n'], { type: 'text/plain' }));
+      }
+      store.saved = v == null ? undefined : v;
+    } catch (e) { /* не записалось: в следующий раз путь вставят заново */ }
+  }
+  /* Что сейчас в поле пути: base (годный путь или '') и пояснение для окна */
+  function baseState() {
+    if (!store.handle) return { base: '', text: '' };
+    const raw = normBase(baseInput.value), folder = String(store.dir.name);
+    if (!raw) {
+      return { base: '', text: 'Столбец ' + ABS_HEADER + ' сейчас не заполняется. Чтобы заполнялся, вставьте сюда путь к папке из адресной строки Проводника.' };
+    }
+    if (!baseValid(raw)) return { base: '', bad: true, text: '⚠ Это не путь Windows. Нужен вид W:\\Отдел\\Папка или \\\\сервер\\папка.' };
+    const room = folderRoom(raw);
+    if (room < 12) {
+      return { base: '', bad: true, text: '❌ Путь слишком длинный (' + raw.length + ' знаков): Windows не откроет снимки. ' +
+        'Нужна папка с путём не длиннее ' + (raw.length + room - 12) + ' знаков.' };
+    }
+    const mismatch = !/^[a-z]:$/i.test(raw) && !sameName(lastPart(raw), folder);
+    const cut = new Set(tasks.filter(t => t.parse.iin && safeName(t.fio).length > room).map(t => t.parse.iin)).size;
+    const lines = [mismatch
+      ? '⚠ Путь кончается папкой «' + lastPart(raw) + '», а выбрана папка «' + folder + '». Ссылки откроются, только если это одна и та же папка.'
+      : '✔ Ссылка в столбце ' + ABS_HEADER + ': этот путь + папка человека + ' + SHOT_NAME + (raw === baseAuto ? '\nПуть взят из самого файла Excel.' : '')];
+    if (cut) lines.push('Длинных имён папок будет укорочено: ' + cut + ' (до ' + room + ' знаков: длиннее путь Windows не откроет).');
+    return { base: raw, mismatch, room, text: lines.join('\n') };
   }
 
   function refresh() {
     const regs = chosen();
     regHead.textContent = 'Реестры: ' + (regs.length === 1 ? regs[0].short : regs.length ? regs.length + ' выбрано' : 'не выбрано');
+    const b = baseState();
+    baseBox.style.display = S && store.handle ? 'block' : 'none';
+    baseNote.textContent = b.text;
+    baseNote.style.color = b.bad || b.mismatch ? '#9a3412' : b.base ? '#1a7f37' : '#5b6577';
+    baseAutoB.style.display = baseAuto && normBase(baseInput.value) !== baseAuto ? 'inline' : 'none';
+    baseAutoB.title = baseAuto;
+    baseInput.style.height = 'auto';                /* поле по высоте текста: длинный путь виден целиком */
+    baseInput.style.height = Math.min(150, Math.max(34, baseInput.scrollHeight + 2)) + 'px';
     if (!S) { summary.textContent = ''; badBox.style.display = 'none'; updateButtons(); return; }
     const p = plan(false), rows = Array.from(p.groups.values()).reduce((a, x) => a + x.length, 0);
     const skipped = [p.linked ? 'уже со ссылкой ' + p.linked : '', p.hiddenRows ? 'скрыто фильтром ' + p.hiddenRows : ''].filter(Boolean).join(', ');
@@ -763,7 +915,7 @@
     stopB.disabled = !running;
     folderB.disabled = fileInput.disabled = fileSelect.disabled = sheetSelect.disabled = running;
     for (const b of regChecks.values()) b.disabled = running;
-    visibleBox.disabled = running;
+    visibleBox.disabled = baseInput.disabled = running;
     xlsxB.style.display = S ? '' : 'none';
   }
 
@@ -853,7 +1005,7 @@
       if (handle.kind === 'file' && /\.(xlsx|xlsm)$/i.test(name) && !name.startsWith('~$')) names.push(name);
     }
     names.sort((a, b) => a.localeCompare(b, 'ru'));
-    store = { dir, shots: null, handle: null };
+    store = { dir, handle: null };
     fileSelect.textContent = '';
     if (!names.length) { book = S = null; tasks = []; fileSelect.style.display = 'none'; refresh(); say('❌ В этой папке нет файлов Excel (.xlsx).'); return; }
     for (const n of names) { const o = h('option', '', n); o.value = n; fileSelect.append(o); }
@@ -873,7 +1025,8 @@
     try {
       book = S = null; tasks = [];
       store.handle = handle;
-      if (!handle) store.dir = store.shots = null;
+      if (!handle) store.dir = null;
+      baseAuto = '';
       store.original = bytes;
       store.backedUp = false;
       const b = await openBook(bytes, name);
@@ -886,8 +1039,14 @@
       sheetSelect.style.display = sheetsWithIin.length > 1 ? 'block' : 'none';
       const active = sheetsWithIin.find(s => s.sheet.index === b.active) || sheetsWithIin[0];
       sheetSelect.value = active.sheet.name;
+      if (handle) {                    /* путь к этой папке: вставленный раньше, иначе записанный в файле самим Excel */
+        const fromFile = normBase(b.absPath);
+        if (baseValid(fromFile) && sameName(lastPart(fromFile), store.dir.name)) baseAuto = fromFile;
+        store.saved = await readSaved();
+        baseInput.value = store.saved || baseAuto;
+      }
       useSheet(active.sheet.name);
-      say(handle ? 'Можно запускать. Снимки: папка ' + SHOTS_DIR + ', в ней папка на каждого человека. Ссылки: прямо в файл.'
+      say(handle ? 'Можно запускать. В этой папке появится папка на каждого человека, в ней ' + SHOT_NAME + '. Ссылки: прямо в файл.'
                  : 'Можно запускать. Снимки и копия файла со ссылками придут в «Загрузки».');
     } catch (e) { book = S = null; tasks = []; refresh(); say('❌ ' + (e.message || e)); }
   }
@@ -1038,22 +1197,25 @@
     return dataCache.get(url);
   }
   const fontKey = f => String(f || '').replace(/["']/g, '').trim().toLowerCase();
-  /* @font-face: шрифт вкладывается, только если страница его действительно загрузила, и одним файлом */
-  async function inlineFonts(text, base, fonts) {
+  /* @font-face: шрифт вкладывается, только если страница его действительно загрузила, и одним файлом.
+     Из перечисленных в правиле файлов берётся тот, который загрузила сама страница, иначе первый годный по порядку
+     (так выбирает и браузер). Форматы embedded-opentype (.eot) и svg браузер не использует: их не берём. */
+  async function inlineFonts(text, base, loaded) {
     const blocks = [];
     text.replace(/@font-face\s*\{[^}]*\}/gi, m => { blocks.push(m); return m; });
     const map = new Map();
     await Promise.all(blocks.map(async block => {
       const family = fontKey((/font-family\s*:\s*([^;}]+)/i.exec(block) || [])[1]);
-      if (!fonts.has(family)) { map.set(block, ''); return; }
+      if (!loaded.fonts.has(family)) { map.set(block, ''); return; }
       const urls = [];
       block.replace(/url\(\s*["']?([^"')]+)["']?\s*\)(?:\s*format\(\s*["']?([^"')]+)["']?\s*\))?/gi, (m, u, f) => { urls.push([u, (f || '').toLowerCase()]); return m; });
-      const rank = ([u, f]) => (/woff2/.test(f) || /\.woff2(\?|#|$)/i.test(u) ? 0 : /woff/.test(f) || /\.woff(\?|#|$)/i.test(u) ? 1
-        : /truetype|opentype/.test(f) || /\.(ttf|otf)(\?|#|$)/i.test(u) ? 2 : 9);
-      const best = urls.filter(x => !x[0].startsWith('data:') && rank(x) < 9).sort((a, b) => rank(a) - rank(b))[0];
+      const abs = x => new URL(x[0], base).href.split('#')[0];
+      const usable = urls.filter(([u, f]) => !u.startsWith('data:') &&
+        (f ? /^(woff2?|truetype|opentype|collection)(-variations)?$/.test(f) : !/\.(eot|svg)(\?|#|$)/i.test(u)));
+      const best = usable.find(x => { try { return loaded.urls.has(abs(x)); } catch (e) { return false; } }) || usable[0];
       if (!best) return;
       try {
-        const data = await toDataUrl(new URL(best[0], base).href.split('#')[0]);
+        const data = await toDataUrl(abs(best));
         const rest = block.slice(block.indexOf('{') + 1, block.lastIndexOf('}')).split(';').filter(d => d.trim() && !/^\s*src\s*:/i.test(d)).join(';');
         map.set(block, '@font-face{' + rest + ';src:url("' + data + '")' + (best[1] ? ' format("' + best[1] + '")' : '') + '}');
       } catch (e) { map.set(block, ''); }
@@ -1061,7 +1223,7 @@
     return text.replace(/@font-face\s*\{[^}]*\}/gi, m => (map.has(m) ? map.get(m) : m));
   }
   async function inlineCss(text, base, loaded, depth) {
-    text = await inlineFonts(text, base, loaded.fonts);
+    text = await inlineFonts(text, base, loaded);
     const imports = [];
     text = text.replace(/@import\s+(?:url\(\s*)?["']?([^"')\s;]+)["']?\s*\)?[^;]*;/g, (m, u) => { imports.push(u); return ''; });
     let headCss = '';
@@ -1154,24 +1316,28 @@
     g.fillRect(0, 0, b.width, b.height);
     g.drawImage(img, 0, 0);
     const px = g.getImageData(0, 0, b.width, b.height).data;
+    const dots = new Uint32Array(px.buffer, px.byteOffset, px.length >> 2);
     let sig = 0, lo = 255, hi = 0;
-    for (let i = 0; i < px.length; i += 148) {                /* выборка точек: отпечаток и разброс яркости */
+    for (let i = 0; i < dots.length; i++) sig = (Math.imul(sig, 31) + dots[i]) | 0;      /* отпечаток по всем точкам: видна и мелочь */
+    for (let i = 0; i < px.length; i += 148) {                /* выборка точек: разброс яркости */
       const y = (px[i] * 3 + px[i + 1] * 6 + px[i + 2]) / 10;
       if (y < lo) lo = y;
       if (y > hi) hi = y;
-      sig = (Math.imul(sig, 31) + px[i] + px[i + 1] * 3 + px[i + 2] * 7) | 0;
     }
     return { canvas, sig, spread: hi - lo };
   }
-  /* Первый проход иногда рисуется раньше, чем подключились шрифты. Берём кадр, только когда два подряд совпали. */
+  /* Шрифты внутри SVG браузер подключает не сразу. Первый проход после запуска помощника рисуется без части из них
+     (на сайте так пропадал значок в меню), и проходы подряд, без паузы, выходят такими же. Поэтому между проходами
+     пауза, а кадр берётся, только когда совпали два прохода, разделённые паузой. */
   async function shoot(d, width) {
     const b = await buildSvg(d, width);
     let prev = await drawSvg(b);
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
+      await sleep(T.SETTLE);
       const next = await drawSvg(b);
-      if (next.sig === prev.sig) { prev = next; break; }
+      const same = next.sig === prev.sig;
       prev = next;
-      await sleep(120);
+      if (same) break;
     }
     if (prev.spread < 60) throw new SiteError('снимок получился пустым');
     return prev.canvas;
@@ -1306,38 +1472,63 @@
   }
 
   /* ---------- запуск ---------- */
+  /* Путь для столбца hyperlink перед запуском: годный путь, '' (без столбца) или null (запуск отменён, путь надо поправить) */
+  async function baseForRun() {
+    if (!store.handle) return '';
+    const b = baseState();
+    if (!b.base) {
+      if (!b.bad && store.saved === '') return '';                     /* уже отвечали «без hyperlink» */
+      const a = await ask(b.bad ? b.text + '\nСтолбец ' + ABS_HEADER + ' останется пустым.'
+        : 'Путь к папке на диске не указан: столбец ' + ABS_HEADER + ' останется пустым.\n' +
+          'Вставьте путь из адресной строки Проводника в поле «Путь к этой папке» и нажмите Старт ещё раз.',
+        ['Указать путь', 'Без ' + ABS_HEADER]);
+      if (a !== 'Без ' + ABS_HEADER) { baseInput.focus(); return null; }
+      if (!b.bad) await writeSaved('');
+      return '';
+    }
+    if (b.mismatch) {
+      const a = await ask('Путь кончается папкой «' + lastPart(b.base) + '», а выбрана папка «' + store.dir.name + '».\n' +
+        'Если это разные папки, ссылки в столбце ' + ABS_HEADER + ' не откроются.', ['Исправить путь', 'Записать так']);
+      if (a !== 'Записать так') { baseInput.focus(); return null; }
+    }
+    await writeSaved(b.base === baseAuto ? null : b.base);      /* путь из файла Excel запоминать незачем */
+    return b.base;
+  }
+
   async function run() {
-    if (running || !S) return;
+    if (running || !S || pendingAsk) return;
     const regs = chosen();
     if (!regs.length) { say('❌ Отметьте хотя бы один реестр.'); regBox.open = true; return; }
     let recheck = false, p = plan(false);
     if (!p.groups.size) {
       if (!tasks.length) { say('В столбце «ИИН/БИН» нет значений.'); return; }
-      if (p.linked) {                 /* новых ИИН нет (строки с опечатками не в счёт): спрашиваем, проверять ли заново */
-        const a = await ask('Новых ИИН нет: ссылка уже записана.\nПроверить все ИИН заново? Старые снимки останутся.', ['Все заново', 'Отмена']);
-        if (a !== 'Все заново') return;
-        recheck = true;
-        p = plan(true);
-      } else if (!p.invalid.length) { say('Все строки с ИИН скрыты фильтром Excel: снимите галочку «только видимые строки».'); return; }
+      if (!p.linked && !p.invalid.length) { say('Все строки с ИИН скрыты фильтром Excel: снимите галочку «только видимые строки».'); return; }
+    }
+    const base = await baseForRun();
+    if (base == null) return;
+    if (!p.groups.size && p.linked) { /* новых ИИН нет (строки с опечатками не в счёт): спрашиваем, проверять ли заново */
+      const a = await ask('Новых ИИН нет: ссылка уже записана.\nПроверить все ИИН заново? Старые снимки останутся.', ['Все заново', 'Отмена']);
+      if (a !== 'Все заново') return;
+      recheck = true;
+      p = plan(true);
     }
     running = true; stopping = false; interval = T.INTERVAL;
     updateButtons();
     say('Проверка началась…');
-    let done = 0, found = 0, notFound = 0, errors = 0, fails = 0, unsaved = 0, written = 0, stopNote = '';
+    let done = 0, found = 0, notFound = 0, errors = 0, fails = 0, diskFails = 0, unsaved = 0, written = 0, stopNote = '';
     const total = p.groups.size;
     try {
       if (store.handle) {
-        store.shots = await store.dir.getDirectoryHandle(SHOTS_DIR, { create: true });
         const w = await store.handle.createWritable({ keepExistingData: true });   /* файл не занят? выясняем до работы */
         await w.close();
       }
-      ensureColumns(S);
+      ensureColumns(S, !!base);
       const L = S.layout;
       for (const t of p.invalid) {
         try { setText(S, t.row, L.resultCol, 'ОШИБКА: ' + t.parse.err, null); } catch (e) { /* объединённая ячейка */ }
         logRow({ time: ruDate(new Date(), true), iin: clean(t.raw) || '?', rows: String(t.row), status: 'НЕВЕРНЫЙ ИИН', counts: '', file: '', note: t.parse.err });
       }
-      const names = folderNames();
+      const names = folderNames(base ? folderRoom(base) : 100);
       for (const [iin, rows] of p.groups) {
         if (stopping) break;
         say('Проверяю ' + (done + 1) + ' из ' + total + ': ' + iin + '\nнайдено ' + found + ' · не найдено ' + notFound + ' · ошибок ' + errors);
@@ -1351,32 +1542,47 @@
           fails = 0;
           const d = describe(res.shots), folder = names.get(iin) || iin;
           const blob = await stamped(res.shots);
-          let target;
-          if (store.shots) {                       /* папка человека, в ней «снимок.png» */
-            const personDir = await store.shots.getDirectoryHandle(folder, { create: true });
-            await keepOld(personDir);
-            await writeFile(personDir, SHOT_NAME, blob);
-            target = SHOTS_DIR + '/' + folder + '/' + SHOT_NAME;
+          let target = '', lost = '';
+          if (store.handle) {                      /* папка человека рядом с файлом Excel, в ней «снимок.png» */
+            try {
+              const personDir = await store.dir.getDirectoryHandle(folder, { create: true });
+              await keepOld(personDir, base ? WIN_PATH - SWAP - base.length - folder.length - 2 : 1000);
+              await writeFile(personDir, SHOT_NAME, blob);
+              target = folder + '/' + SHOT_NAME;
+            } catch (e) { lost = 'снимок не сохранён в папку «' + folder + '»: ' + (e && e.message ? e.message : e); }
           } else {                                 /* в «Загрузки» папку создать нельзя: имя человека в начале имени файла */
             target = folder + ' ' + (recheck ? SHOT_NAME.replace(/\.png$/, ' ' + stampOf(res.shots[res.shots.length - 1].at) + '.png') : SHOT_NAME);
             saveBlob(blob, target);
           }
-          let note = '';
-          for (const r of rows) {
-            try {
-              const cur = (S.cells.get(r) || new Map()).get(L.linkCol);
-              setText(S, r, L.linkCol, target.replace(/\//g, '\\'), await linkStyle(S, cur ? cur.getAttribute('s') : null));
-              await setLink(S, r, L.linkCol, target);
-              setText(S, r, L.resultCol, d.text, null);
-              written++;
-            } catch (e) { note = e.message; }
+          if (lost) {                              /* без снимка ссылку не пишем: строка останется на следующий запуск */
+            errors++; diskFails++;
+            for (const r of rows) { try { setText(S, r, L.resultCol, 'ОШИБКА: ' + lost, null); } catch (e) { /* объединённая ячейка */ } }
+            logRow({ time: ruDate(new Date(), true), iin, rows: rows.join(', '), status: 'ОШИБКА', counts: '', file: '', note: lost });
+          } else {
+            diskFails = 0;
+            const full = base ? base + '\\' + folder + '\\' + SHOT_NAME : '';      /* полный путь к снимку на диске */
+            let note = '';
+            for (const r of rows) {
+              try {
+                const cur = (S.cells.get(r) || new Map()).get(L.linkCol);
+                setText(S, r, L.linkCol, target.replace(/\//g, '\\'), await linkStyle(S, cur ? cur.getAttribute('s') : null));
+                await setLink(S, r, L.linkCol, target);
+                if (full) {
+                  const was = (S.cells.get(r) || new Map()).get(L.absCol);
+                  await setPathLink(S, r, L.absCol, full, await linkStyle(S, was ? was.getAttribute('s') : null, true));
+                }
+                setText(S, r, L.resultCol, d.text, null);
+                written++;
+              } catch (e) { note = e.message; }
+            }
+            if (d.found) found++; else notFound++;
+            logRow({ time: ruDate(new Date(), true), iin, rows: rows.join(', '), status: d.found ? 'НАЙДЕН' : 'НЕ НАЙДЕН',
+              counts: res.shots.map(s => s.reg.key + '=' + s.count).join('; '), file: full || target, note });
           }
-          if (d.found) found++; else notFound++;
-          logRow({ time: ruDate(new Date(), true), iin, rows: rows.join(', '), status: d.found ? 'НАЙДЕН' : 'НЕ НАЙДЕН',
-            counts: res.shots.map(s => s.reg.key + '=' + s.count).join('; '), file: target, note });
         }
         done++; unsaved++;
         if (fails >= MAX_FAILS) { stopNote = 'Сайт не отвечает: ' + fails + ' ИИН подряд не удалось проверить. Попробуйте позже.'; break; }
+        if (diskFails >= MAX_FAILS) { stopNote = 'Снимки не сохраняются в папку: ' + diskFails + ' раза подряд. Проверьте доступ к папке и место на диске.'; break; }
         if (unsaved >= T.SAVE_EVERY && store.handle) { if (await saveBook(false)) unsaved = 0; }
       }
       await saveBook(true);
@@ -1390,10 +1596,14 @@
     refresh();
     say(headLine + '\nПроверено ' + done + ' из ' + total + ' · найдено ' + found + ' · не найдено ' + notFound +
       (errors ? ' · ошибок ' + errors : '') + (p.invalid.length ? '\nНеверных ИИН: ' + p.invalid.length : '') +
-      '\nСсылок записано: ' + written + (store.handle ? '' : '\nФайлы пришли в «Загрузки»: держите их в одной папке.') +
-      (recheck ? '\nПроверка заново: прежние снимки остались в тех же папках, с датой в имени.' : ''));
-    if (journal.length && store.shots) {
-      try { await writeFile(store.shots, 'журнал_tazalau_' + stampOf(new Date()) + '.csv', csvBlob()); } catch (e) { /* журнал доступен кнопкой CSV */ }
+      '\nСсылок записано: ' + written + (base && written ? ' (полный путь: столбец ' + ABS_HEADER + ')' : '') +
+      (store.handle ? '' : '\nФайлы пришли в «Загрузки»: держите их в одной папке.') +
+      (recheck ? '\nПроверка заново: прежние снимки остались в тех же папках, с датой или номером в имени.' : ''));
+    if (journal.length && store.handle) {
+      try {
+        const bdir = await store.dir.getDirectoryHandle(BACKUP_DIR, { create: true });
+        await writeFile(bdir, 'журнал_tazalau_' + stampOf(new Date()) + '.csv', csvBlob());
+      } catch (e) { /* журнал доступен кнопкой CSV */ }
     }
     beep();
   }
@@ -1408,9 +1618,9 @@
     version: VERSION,
     show: () => { if (!root.isConnected) document.body.appendChild(root); },
     /* для автоматических проверок помощника */
-    test: { normIin, checkDigit, openBook, loadSheet, readTasks, ensureColumns, setText, setLink, linkStyle, bookBytes, zipRead,
-      useDir, openBytes, run, timings,
-      state: () => ({ running, journal, tasks: tasks.length, sheet: S && S.sheet.name, layout: S && S.layout }) },
+    test: { normIin, checkDigit, openBook, loadSheet, readTasks, ensureColumns, setText, setLink, setPathLink, linkStyle, bookBytes, zipRead,
+      useDir, openBytes, run, timings, normBase, baseValid, folderRoom, go, buildSvg, drawSvg,
+      state: () => ({ running, journal, tasks: tasks.length, sheet: S && S.sheet.name, layout: S && S.layout, base: baseState().base, baseAuto }) },
   };
   layoutFrame();
   lastRequest = Date.now();           /* первая страница в рамке тоже запрос: следующий пойдёт не раньше, чем через паузу */

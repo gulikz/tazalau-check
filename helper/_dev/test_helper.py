@@ -16,7 +16,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
-from PIL import Image
+from PIL import Image, ImageChops
 from playwright.sync_api import sync_playwright
 
 DEV = Path(__file__).resolve().parent
@@ -33,6 +33,10 @@ REGISTRIES = {
     "/ru/list/bankruptcy-and-insolvent": "flApplicantIin", "/ru/list/debtor": "flApplicantIin",
     "/ru/list/debtor/judicial": "flApplicantXin", "/ru/list/debtor/extrajudicial/terminated-and-cancelled": "flApplicantIin",
 }
+# Любой файл шрифта с компьютера: макет сайта отдаёт его как свой значковый шрифт (macOS, Windows, Linux)
+FONT_CANDIDATES = ["/System/Library/Fonts/Supplemental/Webdings.ttf", "/System/Library/Fonts/Supplemental/Wingdings.ttf",
+                   r"C:\Windows\Fonts\webdings.ttf", r"C:\Windows\Fonts\wingding.ttf",
+                   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf"]
 source = INSTALLER.read_text(encoding="utf-8")
 HREF = html.unescape(re.search(r'<a class="bm" id="bm" href="([^"]+)"', source).group(1))
 VERSION = re.search(r"const VERSION = '([^']+)'", (DEV.parent / "tazalau_helper.js").read_text(encoding="utf-8")).group(1)
@@ -63,6 +67,8 @@ class Site:
         self.fail = {}           # ИИН -> сколько раз ответить ошибкой 500 (-1 = всегда)
         self.wide = set()        # ИИН с очень широкой таблицей
         self.ignore = set()      # ИИН, для которых сайт «не применил фильтр»
+        self.icon_font = None    # файл шрифта: в меню появляется значок, нарисованный «значковым шрифтом сайта»
+        self.font_calls = []
         self.calls = []
 
     def page(self, path, param, iin):
@@ -76,7 +82,9 @@ class Site:
             rows = '<tr><td colspan="5" class="text-center">Нет записей</td></tr>'
         pager = f'<div class="text-nowrap"><span><small>Всего записей</small> {count}</span><ul class="pagination"><li>1</li></ul></div>'
         wide = "min-width:2600px;" if iin in self.wide else ""
-        return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Cписок банкротов</title>
+        icons = '<link rel="stylesheet" href="/icons/style.css">' if self.icon_font else ""
+        icon = '<p><i class="ic ic-a"></i> <span>Qoldau.kz</span></p>' if self.icon_font else ""
+        return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Cписок банкротов</title>{icons}
 <style>
  body{{margin:0;font:14px Arial,sans-serif;background:#eef4f8;color:#1d2433}} body.loading{{visibility:hidden}}
  .left-side-menu{{position:fixed;left:0;top:0;bottom:0;width:320px;background:#fff;padding:20px;box-sizing:border-box}}
@@ -84,7 +92,7 @@ class Site:
  .table-responsive{{overflow-x:auto}} table{{border-collapse:collapse;width:100%;{wide}}} td,th{{padding:8px;text-align:left}}
  ul.pagination{{display:inline-flex;list-style:none;margin:0 0 0 8px;padding:0}} input{{padding:6px;width:300px}}
 </style></head><body class="loading">
-<div class="left-side-menu"><b>TAZALAU</b><p>Реестры</p></div>
+<div class="left-side-menu"><b>TAZALAU</b><p>Реестры</p>{icon}</div>
 <div class="content-page"><h4 class="page-title">Список банкротов ({html.escape(path)})</h4>
 <form method="get"><div class="card"><label>ИИН</label><br><input type="text" name="{param}" value="{html.escape(shown)}"></div>
 {pager}<div class="card"><div class="table-responsive"><table class="table"><thead><tr><th>ФИО</th><th>Категория дела</th>
@@ -99,6 +107,18 @@ class Site:
             return route.fulfill(body="<!doctype html><title>other</title><p>other site</p>", headers={"content-type": "text/html"})
         if url.hostname != "tazalau.qoldau.kz":
             return route.abort()                                   # наружу не выходит ничего
+        if url.path == "/icons/style.css":                         # значковый шрифт описан так же, как на настоящем сайте
+            return route.fulfill(headers={"content-type": "text/css"}, body=(
+                "@font-face {\n  font-family: 'probeicons';\n  src:  url('fonts/probe.eot?x1');\n"
+                "  src:  url('fonts/probe.eot?x1#iefix') format('embedded-opentype'),\n    url('fonts/probe.ttf?x1') format('truetype'),\n"
+                "    url('fonts/probe.svg?x1#probe') format('svg');\n  font-weight: normal;\n  font-style: normal;\n  font-display: block;\n}\n"
+                ".ic { font-family: 'probeicons' !important; font-style: normal; font-size: 40px; line-height: 1; }\n"
+                '.ic-a:before { content: "abc"; }\n'))
+        if url.path.startswith("/icons/fonts/"):
+            self.font_calls.append(url.path)
+            if url.path.endswith(".ttf") and self.icon_font:
+                return route.fulfill(headers={"content-type": "font/ttf"}, body=Path(self.icon_font).read_bytes())
+            return route.fulfill(status=404, body="not found", headers={"content-type": "text/plain"})
         param = REGISTRIES.get(url.path.rstrip("/"))
         if not param:
             return route.fulfill(status=404, body="not found", headers={"content-type": "text/plain"})
@@ -140,7 +160,7 @@ def make_book(rows, title="восстановление", extra=None):
 BASE_ROWS = [("первый", A, "KZ1"), ("второй", int(B), "KZ2"), ("первый ещё раз", f" {A} ", "KZ3"),
              ("опечатка", A[:11] + str((int(A[11]) + 1) % 10), "KZ4"), ("третий", "000000000000", "KZ5")]
 
-FAST = {"INTERVAL": 0, "BACKOFF": [20, 20, 20], "LIMIT_PAUSE": 40, "NAV_TIMEOUT": 6000, "SAVE_EVERY": 2}
+FAST = {"INTERVAL": 0, "BACKOFF": [20, 20, 20], "LIMIT_PAUSE": 40, "NAV_TIMEOUT": 6000, "SAVE_EVERY": 2, "SETTLE": 20}
 DONE = "() => /^(✔ Готово\\.|⏹ Остановлено\\.|❌ )/.test(document.querySelector('#tazalau-state').textContent)"
 STATE = "() => document.querySelector('#tazalau-state').textContent"
 
@@ -190,12 +210,44 @@ def opfs_tree(page, folder=""):
     return {name: base64.b64decode(data) for name, data in listing.items()}
 
 
-def use_folder(page, folder):
-    page.evaluate("""async folder => {
+def use_folder(page, folder, base=None):
+    """Открыть папку в помощнике. Путь к папке на диске (для столбца hyperlink) помощник помнит в самой папке,
+    в файле tazalau_backup/путь_к_папке.txt:
+    None: на вопрос о пути уже ответили «без hyperlink» (в файле слово «нет»); "": ничего не запомнено, как при
+    первом запуске; "keep": что запомнено, то и остаётся; иначе путь вставляется в поле."""
+    page.evaluate("""async ([folder, base]) => {
         const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(folder);
+        if (base === null) {
+            const service = await dir.getDirectoryHandle('tazalau_backup', { create: true });
+            const w = await (await service.getFileHandle('путь_к_папке.txt', { create: true })).createWritable();
+            await w.write('нет\\r\\n');
+            await w.close();
+        } else if (base !== 'keep') {
+            try { await (await dir.getDirectoryHandle('tazalau_backup')).removeEntry('путь_к_папке.txt'); } catch (e) { /* и не было */ }
+        }
         await window.__tazalau.test.useDir(dir);
-    }""", folder)
+    }""", [folder, base])
     page.wait_for_function("() => window.__tazalau.test.state().sheet")
+    if base and base != "keep":
+        page.fill("#tazalau-base", base)
+        page.locator("#tazalau-base").dispatch_event("change")
+
+
+def with_abs_path(data, folder_url):
+    """Книга «как из Excel»: Excel записывает в файл папку, где его сохранили (x15ac:absPath)."""
+    source, out = zipfile.ZipFile(io.BytesIO(data)), io.BytesIO()
+    mark = ('<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x15">'
+            f'<x15ac:absPath url="{html.escape(folder_url)}" xmlns:x15ac="http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac"/>'
+            '</mc:Choice></mc:AlternateContent>')
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            body = source.read(item.filename)
+            if item.filename == "xl/workbook.xml":
+                text, count = re.subn(r"(<workbookPr\b[^>]*/>)", lambda m: m.group(1) + mark, body.decode("utf-8"), count=1)
+                assert count == 1, "в книге нет <workbookPr/>"
+                body = text.encode("utf-8")
+            target.writestr(item, body)
+    return out.getvalue()
 
 
 def run_and_wait(page, timeout=90000):
@@ -267,6 +319,7 @@ with sync_playwright() as p:
     panel = page.inner_text("body")
     expect("файл: сводка по файлу", "Строк с ИИН 5" in panel and "К проверке: 3 ИИН (строк 4)" in panel, panel[:400])
     expect("файл: неверный ИИН показан с причиной", "Строк с неверным ИИН: 1" in panel)
+    expect("файл: поля пути к папке нет (куда придут файлы, неизвестно)", page.locator("#tazalau-base").is_hidden())
     final = run_and_wait(page)
     page.wait_for_timeout(800)
     got = {d.suggested_filename: Path(d.path()).read_bytes() for d in downloads}
@@ -310,18 +363,23 @@ with sync_playwright() as p:
     expect("папка: служебный файл Excel не предлагается", page.evaluate("() => window.__tazalau.test.state().sheet") == "восстановление")
     final = run_and_wait(page)
     tree = opfs_tree(page, "work")
-    shots = sorted(n for n in tree if n.startswith("tazalau_screenshots/") and n.endswith(".png"))
-    backups = [n for n in tree if n.startswith("tazalau_backup/")]
+    shots = sorted(n for n in tree if n.endswith(".png"))
+    backups = [n for n in tree if n.startswith("tazalau_backup/") and n.endswith(".xlsx")]
     expect("папка: итог", "✔ Готово" in final and "найдено 1 · не найдено 3" in final and "Ссылок записано: 5" in final, final)
-    expect("папка: у каждого человека своя папка, в ней «снимок.png»", shots == [
-        f"tazalau_screenshots/{name}/снимок.png" for name in ("второй", "первый", "третий", "четвёртый")], shots)
+    expect("папка: у каждого человека своя папка рядом с файлом Excel, в ней «снимок.png»", shots == [
+        f"{name}/снимок.png" for name in ("второй", "первый", "третий", "четвёртый")], shots)
     expect("папка: резервная копия совпадает с исходным файлом байт в байт", len(backups) == 1 and tree[backups[0]] == original, backups)
-    expect("папка: журнал сохранён рядом со снимками", any(re.match(r"tazalau_screenshots/журнал_tazalau_.*\.csv$", n) for n in tree), sorted(tree))
+    expect("папка: журнал сохранён в служебную папку", any(re.match(r"tazalau_backup/журнал_tazalau_.*\.csv$", n) for n in tree), sorted(tree))
+    expect("папка: кроме папок людей и служебной папки, ничего лишнего не появилось",
+           {n.split("/")[0] for n in tree} == {"отчет по банкротству.xlsx", "~$отчет по банкротству.xlsx", "tazalau_backup",
+                                               "второй", "первый", "третий", "четвёртый"}, sorted(tree))
     patched = tree["отчет по банкротству.xlsx"]
     wb = check_xlsx("папка", original, patched)
     ws = wb["восстановление"]
     target = ws["D2"].hyperlink.target
-    expect("папка: ссылка относительная, в подпапку", target in shots and ws["D2"].value == target.replace("/", "\\"), (target, ws["D2"].value))
+    expect("папка: ссылка относительная, в папку человека", target in shots and ws["D2"].value == target.replace("/", "\\"), (target, ws["D2"].value))
+    expect("папка: без пути к папке столбец hyperlink не создаётся", [ws.cell(1, c).value for c in range(4, 7)] == ["tazalau_file_location", "tazalau_result", None],
+           [ws.cell(1, c).value for c in range(1, 7)])
     expect("папка: записей 2", "записей: 2" in str(ws["E2"].value), ws["E2"].value)
     temp = DEV / "out"
     temp.mkdir(exist_ok=True)
@@ -346,10 +404,10 @@ with sync_playwright() as p:
     page.get_by_text("Все заново").click()
     page.wait_for_function(DONE)
     tree = opfs_tree(page, "work")
-    again = sorted(n for n in tree if n.startswith("tazalau_screenshots/первый/") and n.endswith(".png"))
+    again = sorted(n for n in tree if n.startswith("первый/") and n.endswith(".png"))
     expect("повтор «все заново»: «снимок.png» свежий, прежний остался с датой в имени",
-           len(again) == 2 and again[0] == "tazalau_screenshots/первый/снимок.png"
-           and re.fullmatch(r"tazalau_screenshots/первый/снимок_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.png", again[1])
+           len(again) == 2 and again[0] == "первый/снимок.png"
+           and re.fullmatch(r"первый/снимок_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.png", again[1])
            and len(site.calls) == calls_before + 4, (again, len(site.calls), calls_before))
     wb2 = check_xlsx("повтор", original, tree["отчет по банкротству.xlsx"])
     rels = zipfile.ZipFile(io.BytesIO(tree["отчет по банкротству.xlsx"])).read("xl/worksheets/_rels/sheet1.xml.rels").decode()
@@ -385,35 +443,354 @@ with sync_playwright() as p:
     expect("FIO: помощник сообщает, что папки будут по столбцу FIO", "Папки снимков: по столбцу FIO" in page.inner_text("body"))
     final = run_and_wait(page)
     tree = opfs_tree(page, "fio")
-    folders = sorted({n.split("/")[1] for n in tree if n.startswith("tazalau_screenshots/") and n.endswith(".png")})
+    folders = sorted({n.split("/")[0] for n in tree if n.endswith(".png")})
     expect("FIO: папка на человека, однофамильцам добавлен ИИН, без имени: по ИИН, лишние знаки убраны", folders == sorted([
         f"ИВАНОВ ИВАН ИВАНОВИЧ {A}", f"Иванов Иван Иванович {B}", "Петров Пётр", D, "ТОО Ромашка филиал отдел №1"]), folders)
     expect("FIO: в каждой папке один файл «снимок.png»", sorted(n for n in tree if n.endswith(".png")) == sorted(
-        f"tazalau_screenshots/{f}/снимок.png" for f in folders), sorted(n for n in tree if n.endswith(".png")))
+        f"{f}/снимок.png" for f in folders), sorted(n for n in tree if n.endswith(".png")))
     ws = check_xlsx("FIO", original, tree["iin.xlsx"])["ИИН"]
     expect("FIO: столбцы на месте, результат добавлен", [ws.cell(1, c).value for c in range(1, 5)] == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result"])
     expect("FIO: ссылка ведёт в папку человека (пробелы в адресе закодированы)",
-           ws["C2"].hyperlink.target == f"tazalau_screenshots/ИВАНОВ%20ИВАН%20ИВАНОВИЧ%20{A}/снимок.png"
-           and ws["C2"].value == f"tazalau_screenshots\\ИВАНОВ ИВАН ИВАНОВИЧ {A}\\снимок.png", (ws["C2"].hyperlink.target, ws["C2"].value))
+           ws["C2"].hyperlink.target == f"ИВАНОВ%20ИВАН%20ИВАНОВИЧ%20{A}/снимок.png"
+           and ws["C2"].value == f"ИВАНОВ ИВАН ИВАНОВИЧ {A}\\снимок.png", (ws["C2"].hyperlink.target, ws["C2"].value))
     expect("FIO: адрес ссылки после раскодирования совпадает с настоящим файлом",
            all(urllib.parse.unquote(ws.cell(r, 3).hyperlink.target) in tree for r in range(2, 8)),
            [ws.cell(r, 3).hyperlink.target for r in range(2, 8)])
     expect("FIO: один человек в двух строках: один запрос, одна папка, две ссылки",
-           [c[1] for c in site.calls].count(C) == 1 and ws["C4"].hyperlink.target == ws["C5"].hyperlink.target == "tazalau_screenshots/Петров%20Пётр/снимок.png")
+           [c[1] for c in site.calls].count(C) == 1 and ws["C4"].hyperlink.target == ws["C5"].hyperlink.target == "Петров%20Пётр/снимок.png")
     for header in ("ФИО", "Ф.И.О.", "fio"):
         opfs_put(page, "iin.xlsx", fio_book(header, [("Сидоров Сидор", A)]), "fio_" + header.replace(".", ""))
         use_folder(page, "fio_" + header.replace(".", ""))
         run_and_wait(page)
         expect(f"FIO: заголовок «{header}» тоже подходит",
-               "tazalau_screenshots/Сидоров Сидор/снимок.png" in opfs_tree(page, "fio_" + header.replace(".", "")))
+               "Сидоров Сидор/снимок.png" in opfs_tree(page, "fio_" + header.replace(".", "")))
     opfs_put(page, "iin.xlsx", fio_book(None, [(None, A), (None, int(B))]), "nofio")
     use_folder(page, "nofio")
     expect("без FIO: помощник предупреждает, что папки будут по ИИН", "Столбца FIO нет: папки снимков по ИИН" in page.inner_text("body"))
     run_and_wait(page)
     expect("без FIO: папки называются по ИИН", sorted(n for n in opfs_tree(page, "nofio") if n.endswith(".png")) == sorted(
-        f"tazalau_screenshots/{i}/снимок.png" for i in (A, B)))
+        f"{i}/снимок.png" for i in (A, B)))
     expect("FIO: страница без ошибок", not page.errors, page.errors[:3])
     page.close()
+
+    # ---------- 3б. столбец hyperlink: полная ссылка «путь к папке на диске + папка человека + снимок.png» ----------
+    site.calls.clear()
+    site.found = {A: 1}
+    page = open_helper(ctx, site, {"width": 1366, "height": 768})
+    for label, given, want in [
+        ("путь к самому файлу в кавычках", '"W:\\Отдел\\Папка\\iin.xlsx"', r"W:\Отдел\Папка"),
+        ("черта в конце", "W:\\Отдел\\Папка\\", r"W:\Отдел\Папка"),
+        ("прямые черты и пробелы по краям", "  W:/Отдел/Папка/ ", r"W:\Отдел\Папка"),
+        ("невидимый знак в начале", "\u202aW:\\Отдел\\Папка", r"W:\Отдел\Папка"),
+        ("двойная черта внутри", "W:\\Отдел\\\\Папка", r"W:\Отдел\Папка"),
+        ("адрес file:///", "file:///W:/Отдел/Папка%20с%20пробелом", r"W:\Отдел\Папка с пробелом"),
+        ("сетевой путь", "\\\\fileserver\\share\\Общая папка\\", r"\\fileserver\share\Общая папка"),
+        ("сетевой адрес file://", "file://fileserver/share/dir", r"\\fileserver\share\dir"),
+    ]:
+        got = page.evaluate("v => window.__tazalau.test.normBase(v)", given)
+        expect(f"путь к папке: {label}", got == want, got)
+    valid = page.evaluate("list => list.map(v => window.__tazalau.test.baseValid(window.__tazalau.test.normBase(v)))",
+                          ["W:\\Отдел", "W:", "\\\\srv\\share", "\\\\srv", "Отдел\\Папка", "W:\\От|дел", "/Users/x", "просто текст"])
+    expect("путь к папке: годится только путь Windows", valid == [True, True, True, False, False, False, False, False], valid)
+
+    def template(people, heads=("FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink")):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ИИН"
+        ws.append(list(heads))
+        for name, iin in people:
+            ws.append([name, iin])
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    def heads_of(ws, count=6):
+        return [ws.cell(1, c).value for c in range(1, count + 1)]
+
+    SAVED = "tazalau_backup/путь_к_папке.txt"            # здесь помощник помнит путь, вставленный вручную
+
+    def set_base(page, text):
+        page.fill("#tazalau-base", text)
+        page.locator("#tazalau-base").dispatch_event("change")
+
+    def path_of(cell):
+        """Путь из формулы =HYPERLINK("путь") в столбце hyperlink."""
+        found = re.fullmatch(r'=HYPERLINK\("(.*)"\)', str(cell.value or ""))
+        return found.group(1) if found else None
+
+    def shown(data, ref):
+        """Что видно в ячейке, пока Excel не пересчитал формулу (сохранённое значение)."""
+        return load_workbook(io.BytesIO(data), data_only=True)["ИИН"][ref].value
+
+    # (а) путь к папке записан в файле самим Excel: вводить ничего не надо
+    BASE = r"W:\Отдел\Архив 2026\Проверка платежеспособности"
+    FOLDER = "Проверка платежеспособности"
+    people = [("Иванов Иван Иванович", A), ("Петров Пётр", int(B)), ("Петров Пётр", int(B))]
+    original = with_abs_path(fio_book("FIO", people), BASE + "\\")
+    opfs_put(page, "iin.xlsx", original, FOLDER)
+    use_folder(page, FOLDER, "")
+    note = page.inner_text("#tazalau-base-state")
+    expect("hyperlink: путь к папке взят из самого файла Excel", page.input_value("#tazalau-base") == BASE
+           and "✔" in note and "Путь взят из самого файла Excel" in note, (page.input_value("#tazalau-base"), note))
+    final = run_and_wait(page)
+    tree = opfs_tree(page, FOLDER)
+    ws = check_xlsx("hyperlink", original, tree["iin.xlsx"])["ИИН"]
+    expect("hyperlink: столбец добавлен рядом со ссылкой", heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "tazalau_result", None], heads_of(ws))
+    full = BASE + "\\Иванов Иван Иванович\\снимок.png"
+    expect("hyperlink: ссылка записана формулой с полным путём: папка на диске + папка человека + снимок.png",
+           ws["D2"].value == '=HYPERLINK("' + full + '")' and ws["D2"].data_type == "f", ws["D2"].value)
+    expect("hyperlink: в ячейке виден сам полный путь", shown(tree["iin.xlsx"], "D2") == full, shown(tree["iin.xlsx"], "D2"))
+    expect("hyperlink: путь в формуле короче предела Excel для текста в формуле (255 знаков)", len(full) < 255, len(full))
+    expect("hyperlink: ссылка синяя и подчёркнутая", ws["D2"].font.color.rgb.endswith("0563C1") and ws["D2"].font.underline == "single")
+    sheet_xml = zipfile.ZipFile(io.BytesIO(tree["iin.xlsx"])).read("xl/worksheets/sheet1.xml").decode()
+    expect("hyperlink: формула в файле записана как положено", '<c r="D2"' in sheet_xml and re.search(
+        r'<c r="D2"[^>]*t="str"[^>]*><f>HYPERLINK\("W:\\Отдел\\Архив 2026\\[^"<]*\\снимок\.png"\)</f><v>W:\\[^<]*</v></c>', sheet_xml) is not None,
+        re.findall(r'<c r="D2".*?</c>', sheet_xml))
+    expect("hyperlink: обычная ссылка (относительная) остаётся только в столбце tazalau_file_location",
+           sheet_xml.count("<hyperlink ") == 3 and all(ws.cell(r, 4).hyperlink is None and ws.cell(r, 3).hyperlink for r in (2, 3, 4)),
+           sheet_xml.count("<hyperlink "))
+    expect("hyperlink: полный путь ведёт к тому же файлу, что и короткая ссылка, и файл есть",
+           all(path_of(ws.cell(r, 4)) == BASE + "\\" + urllib.parse.unquote(ws.cell(r, 3).hyperlink.target).replace("/", "\\")
+               and urllib.parse.unquote(ws.cell(r, 3).hyperlink.target) in tree for r in (2, 3, 4)),
+           [(ws.cell(r, 3).hyperlink.target, ws.cell(r, 4).value) for r in (2, 3, 4)])
+    expect("hyperlink: один человек в двух строках: одна и та же ссылка", ws["D3"].value == ws["D4"].value
+           and path_of(ws["D3"]).endswith("\\Петров Пётр\\снимок.png"), ws["D3"].value)
+    expect("hyperlink: итог упоминает столбец", "столбец hyperlink" in final and "Ссылок записано: 3" in final, final)
+    expect("hyperlink: путь из файла Excel нигде отдельно не запоминается", SAVED not in tree, sorted(tree))
+    expect("hyperlink: в текстах нет длинных тире", "—" not in note + final + page.inner_text("body"))
+
+    # (б) в файле уже есть столбец hyperlink, пути в файле нет: помощник спрашивает, путь вставляют один раз
+    site.calls.clear()
+    original = template([("Сидоров Сидор", A), ("Кузнецова Анна", int(C))])
+    opfs_put(page, "iin.xlsx", original, "manual")
+    use_folder(page, "manual", "")
+    note = page.inner_text("#tazalau-base-state")
+    expect("hyperlink: пути нет: помощник сообщает, что столбец не заполняется", page.input_value("#tazalau-base") == ""
+           and "сейчас не заполняется" in note, note)
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /Путь к папке на диске не указан/.test(document.body.innerText)")
+    page.get_by_role("button", name="Указать путь").click()
+    page.wait_for_timeout(300)
+    expect("hyperlink: без пути помощник спрашивает и до ответа сайт не запрашивает",
+           not site.calls and page.evaluate("() => document.activeElement.id") == "tazalau-base", site.calls)
+    set_base(page, '"W:\\Отдел\\manual\\iin.xlsx"')
+    note = page.inner_text("#tazalau-base-state")
+    expect("hyperlink: вставленный путь к файлу в кавычках приведён к пути папки",
+           page.input_value("#tazalau-base") == r"W:\Отдел\manual" and "✔" in note, (page.input_value("#tazalau-base"), note))
+    final = run_and_wait(page)
+    tree = opfs_tree(page, "manual")
+    ws = check_xlsx("hyperlink вручную", original, tree["iin.xlsx"])["ИИН"]
+    expect("hyperlink: готовый столбец заполнен, второй такой же не создан",
+           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "tazalau_result", None], heads_of(ws))
+    expect("hyperlink: путь, вставленный вручную", path_of(ws["D2"]) == r"W:\Отдел\manual\Сидоров Сидор\снимок.png"
+           and shown(tree["iin.xlsx"], "D2") == r"W:\Отдел\manual\Сидоров Сидор\снимок.png"
+           and ws["C2"].hyperlink.target == "Сидоров%20Сидор/снимок.png" and "Сидоров Сидор/снимок.png" in tree, ws["D2"].value)
+    expect("hyperlink: вставленный путь запомнен в самой папке (tazalau_backup), а не в браузере",
+           tree.get(SAVED, b"").decode("utf-8").strip() == r"W:\Отдел\manual"
+           and page.evaluate("() => Object.keys(localStorage).concat(Object.keys(sessionStorage)).filter(k => /tazalau/i.test(k)).length") == 0,
+           tree.get(SAVED))
+    use_folder(page, "manual", "keep")
+    expect("hyperlink: при следующем открытии папки путь уже стоит в поле", page.input_value("#tazalau-base") == r"W:\Отдел\manual",
+           page.input_value("#tazalau-base"))
+
+    # в столбце hyperlink уже стояла своя ссылка, а ячейка была в формате «Текст»
+    site.calls.clear()
+
+    def old_link(wb, ws):
+        ws["D2"].value = "старая ссылка"
+        ws["D2"].hyperlink = "old/1.png"
+        ws["D2"].number_format = "@"
+        ws["E2"].value = "заметка"
+        ws["E2"].hyperlink = "old/2.png"
+
+    wb0 = load_workbook(io.BytesIO(template([("Сидоров Сидор", A)], heads=("FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "Заметки"))))
+    old_link(wb0, wb0["ИИН"])
+    buffer = io.BytesIO()
+    wb0.save(buffer)
+    original = buffer.getvalue()
+    opfs_put(page, "iin.xlsx", original, "старое")
+    use_folder(page, "старое", r"W:\Отдел\старое")
+    final = run_and_wait(page)
+    patched = opfs_tree(page, "старое")["iin.xlsx"]
+    ws = check_xlsx("hyperlink поверх старой ссылки", original, patched)["ИИН"]
+    archive = zipfile.ZipFile(io.BytesIO(patched))
+    sheet_xml, rels = archive.read("xl/worksheets/sheet1.xml").decode(), archive.read("xl/worksheets/_rels/sheet1.xml.rels").decode()
+    expect("hyperlink: прежняя ссылка ячейки убрана вместе с адресом, чужая ссылка рядом цела",
+           path_of(ws["D2"]) == r"W:\Отдел\старое\Сидоров Сидор\снимок.png" and ws["D2"].hyperlink is None
+           and '<hyperlink ref="D2"' not in sheet_xml and "old/1.png" not in rels and ws["E2"].hyperlink.target == "old/2.png"
+           and ws["E2"].value == "заметка", (ws["D2"].value, rels))
+    expect("hyperlink: формат «Текст» заменён на «Общий», результат записан за последним столбцом",
+           ws["D2"].number_format == "General" and heads_of(ws, 7) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "Заметки", "tazalau_result", None],
+           (ws["D2"].number_format, heads_of(ws, 7)))
+
+    # (в) путь кончается другой папкой: предупреждение и вопрос; сетевой путь
+    site.calls.clear()
+    original = template([("Сидоров Сидор", A)])
+    opfs_put(page, "iin.xlsx", original, "unc")
+    use_folder(page, "unc", "\\\\fileserver\\share\\Общая папка\\другая")
+    note = page.inner_text("#tazalau-base-state")
+    expect("hyperlink: путь кончается не той папкой: предупреждение", "Путь кончается папкой «другая», а выбрана папка «unc»" in note, note)
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /Если это разные папки/.test(document.body.innerText)")
+    page.get_by_role("button", name="Исправить путь").click()
+    page.wait_for_timeout(300)
+    expect("hyperlink: «Исправить путь» ничего не запускает", not site.calls, site.calls)
+    set_base(page, "\\\\fileserver\\share\\Общая папка\\unc\\")
+    final = run_and_wait(page)
+    ws = check_xlsx("hyperlink сеть", original, opfs_tree(page, "unc")["iin.xlsx"])["ИИН"]
+    expect("hyperlink: сетевой путь", ws["D2"].value == r'=HYPERLINK("\\fileserver\share\Общая папка\unc\Сидоров Сидор\снимок.png")', ws["D2"].value)
+    opfs_put(page, "iin.xlsx", original, "other")
+    use_folder(page, "other", r"W:\Отдел\не та")
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /Если это разные папки/.test(document.body.innerText)")
+    page.get_by_role("button", name="Записать так").click()
+    page.wait_for_function(DONE)
+    ws = load_workbook(io.BytesIO(opfs_tree(page, "other")["iin.xlsx"]))["ИИН"]
+    expect("hyperlink: «Записать так»: записан путь, который указал человек", path_of(ws["D2"]) == r"W:\Отдел\не та\Сидоров Сидор\снимок.png", ws["D2"].value)
+
+    # (г) «Без hyperlink»: столбец не создаётся, второй раз вопроса нет
+    site.calls.clear()
+    original = template([("Сидоров Сидор", A), ("Кузнецова Анна", int(C))], heads=("FIO", "ИИН/БИН"))
+    opfs_put(page, "iin.xlsx", original, "decline")
+    use_folder(page, "decline", "")
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /Путь к папке на диске не указан/.test(document.body.innerText)")
+    page.get_by_role("button", name="Без hyperlink").click()
+    page.wait_for_function(DONE)
+    tree = opfs_tree(page, "decline")
+    ws = check_xlsx("без hyperlink", original, tree["iin.xlsx"])["ИИН"]
+    expect("hyperlink: «Без hyperlink»: проверка идёт, столбца нет, ответ запомнен в папке",
+           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", None, None]
+           and ws["C2"].hyperlink.target == "Сидоров%20Сидор/снимок.png" and tree.get(SAVED, b"").decode("utf-8").strip() == "нет",
+           (heads_of(ws), tree.get(SAVED)))
+    use_folder(page, "decline", "keep")
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /ссылка уже записана/.test(document.body.innerText)")
+    expect("hyperlink: ответ «без hyperlink» запомнен, второй раз о пути не спрашивают", "Путь к папке на диске не указан" not in page.inner_text("body"))
+    page.get_by_role("button", name="Отмена").click()
+    page.wait_for_timeout(200)
+
+    # (д) длинный путь, как на сетевом диске: длинные имена папок укорачиваются, путь к снимку открывается в Windows
+    def long_base(total, tail):
+        text = "W:"
+        while len(text) + len(tail) < total:
+            text += "\\" + "Каталог_с_длинным_именем"[: total - len(tail) - len(text) - 1]
+        return text + tail
+
+    LONG = long_base(195, "\\длинный путь")
+    room = page.evaluate("v => window.__tazalau.test.folderRoom(v)", LONG)
+    cut = lambda name, n: name[:n].rstrip(". ")
+    fits, long1, twin = ("Нурмагамбетова Айгерим Бахытжановна", "Абдрахманова-Нурмагамбетова Гульбаршын Сейткамзаевна",
+                         "Константинопольская Александра Владиславовна")
+    expect("длинный путь: на имя папки остаётся 42 знака", len(LONG) == 195 and room == 42 and len(fits) <= room < min(len(long1), len(twin)), (len(LONG), room))
+    site.calls.clear()
+    original = template([(fits, A), (long1, int(B)), (twin, int(C)), (twin, D)])
+    opfs_put(page, "iin.xlsx", original, "длинный путь")
+    use_folder(page, "длинный путь", LONG)
+    note = page.inner_text("#tazalau-base-state")
+    expect("длинный путь: помощник предупреждает, сколько имён укоротит", "✔" in note and "будет укорочено: 3 (до 42 знаков" in note, note)
+    final = run_and_wait(page)
+    tree = opfs_tree(page, "длинный путь")
+    ws = check_xlsx("длинный путь", original, tree["iin.xlsx"])["ИИН"]
+    want = [fits, cut(long1, room), cut(cut(twin, room), room - 13) + " " + C, cut(cut(twin, room), room - 13) + " " + D]
+    expect("длинный путь: имена папок укорочены, одинаковым после укорочения добавлен ИИН",
+           [path_of(ws.cell(r, 4)) for r in range(2, 6)] == [LONG + "\\" + f + "\\снимок.png" for f in want]
+           and all(f + "/снимок.png" in tree for f in want), [str(ws.cell(r, 4).value)[len(LONG):] for r in range(2, 6)])
+    longest = max(len(path_of(ws.cell(r, 4)) or "") for r in range(2, 6))
+    expect("длинный путь: полный путь к снимку с запасом короче 259 знаков", longest <= 259 - 7 - 3 and all(len(f) <= room for f in want), longest)
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /ссылка уже записана/.test(document.body.innerText)")
+    page.get_by_text("Все заново").click()
+    page.wait_for_function(DONE)
+    tree = opfs_tree(page, "длинный путь")
+    pictures = sorted(n for n in tree if n.endswith(".png"))
+    expect("длинный путь: при проверке заново прежний снимок получает короткое имя с номером (имя с датой не поместилось бы)",
+           pictures == sorted(f + "/" + name for f in want for name in ("снимок.png", "снимок_1.png")), pictures)
+    expect("длинный путь: и прежний снимок открывается в Windows", max(len(LONG) + 1 + len(n) for n in pictures) + 7 <= 259,
+           max(len(LONG) + 1 + len(n) for n in pictures))
+
+    # (е) слишком длинный путь и не путь вовсе
+    site.calls.clear()
+    original = template([("Сидоров Сидор", A)], heads=("FIO", "ИИН/БИН"))
+    opfs_put(page, "iin.xlsx", original, "слишком")
+    use_folder(page, "слишком", long_base(230, "\\слишком"))
+    note = page.inner_text("#tazalau-base-state")
+    expect("путь к папке: слишком длинный путь назван прямо", "Путь слишком длинный (230 знаков)" in note and "не длиннее 225 знаков" in note, note)
+    set_base(page, "просто текст")
+    note = page.inner_text("#tazalau-base-state")
+    expect("путь к папке: не путь Windows", "Это не путь Windows" in note, note)
+    page.get_by_text("▶ Старт").click()
+    page.wait_for_function("() => /останется пустым/.test(document.body.innerText)")
+    expect("путь к папке: при неверном пути помощник спрашивает перед запуском", not site.calls
+           and "Это не путь Windows" in page.inner_text("body"), site.calls)
+    page.get_by_role("button", name="Без hyperlink").click()
+    page.wait_for_function(DONE)
+    tree = opfs_tree(page, "слишком")
+    ws = load_workbook(io.BytesIO(tree["iin.xlsx"]))["ИИН"]
+    expect("путь к папке: с неверным путём столбец hyperlink не пишется, а неверный путь не запоминается как отказ",
+           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", None, None] and SAVED not in tree, (heads_of(ws), sorted(tree)))
+
+    # (ж) снимок одного человека не сохранился (на месте его папки лежит файл): ошибка только в его строке
+    site.calls.clear()
+    original = template([("Сидоров Сидор", A), ("Кузнецова Анна", int(C))], heads=("FIO", "ИИН/БИН"))
+    opfs_put(page, "iin.xlsx", original, "занято")
+    opfs_put(page, "Сидоров Сидор", b"file, not a folder", "занято")
+    use_folder(page, "занято", r"W:\Отдел\занято")
+    final = run_and_wait(page)
+    ws = check_xlsx("сбой записи", original, opfs_tree(page, "занято")["iin.xlsx"])["ИИН"]
+    expect("сбой записи: ошибка в строке этого человека, ссылки нет, остальные проверены",
+           ws["C2"].hyperlink is None and ws["D2"].value is None
+           and str(ws["E2"].value).startswith("ОШИБКА: снимок не сохранён в папку «Сидоров Сидор»")
+           and ws["C3"].hyperlink is not None and path_of(ws["D3"]) == r"W:\Отдел\занято\Кузнецова Анна\снимок.png"
+           and "✔ Готово" in final and "ошибок 1" in final, (ws["E2"].value, final))
+    expect("hyperlink: страница без ошибок", not page.errors, page.errors[:3])
+    page.close()
+
+    # ---------- 3в. значковый шрифт сайта попадает на снимок (и на самый первый после запуска помощника) ----------
+    font_file = next((f for f in map(Path, FONT_CANDIDATES) if f.is_file()), None)
+    if font_file is None:
+        print("пропущено: на этом компьютере не нашлось файла шрифта для проверки значков")
+    else:
+        site.calls.clear()
+        site.found = {}
+        site.icon_font = font_file
+        page = open_helper(ctx, site, {"width": 1366, "height": 768})          # новый запуск помощника: шрифты ещё не прогреты
+        opfs_put(page, "iin.xlsx", make_book([("значок", A, "")]), "icons")
+        use_folder(page, "icons")
+        final = run_and_wait(page)
+        mine = Image.open(io.BytesIO(opfs_tree(page, "icons")["значок/снимок.png"])).convert("RGB")
+        real = ctx.new_page()
+        real.set_viewport_size({"width": 1920, "height": 1000})
+        real.goto(f"{SITE}/ru/list/bankruptcy/recovery?flApplicantXin={A}")
+        real.wait_for_function("() => !document.body.classList.contains('loading') && document.fonts.status === 'loaded'")
+        real.wait_for_timeout(300)
+        reference = Image.open(io.BytesIO(real.screenshot(full_page=True))).convert("RGB")
+        plain = real.evaluate("""() => { const i = document.querySelector('.ic'); i.style.setProperty('font-family', 'Arial', 'important');
+            const r = i.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }""")
+        fallback = Image.open(io.BytesIO(real.screenshot(full_page=True))).convert("RGB")     # так значок выглядит БЕЗ шрифта сайта
+        real.close()
+        strip = mine.height - reference.height
+        box = (0, 0, 320, 160)
+
+        def strong(a, b):
+            """Сколько точек заметно отличаются, с допуском сдвига на одну точку."""
+            diff = None
+            for dx, dy in ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)):
+                step = ImageChops.difference(a, ImageChops.offset(b, dx, dy)).convert("L")
+                diff = step if diff is None else ImageChops.darker(diff, step)
+            return sum(diff.crop((1, 1, a.width - 1, a.height - 1)).histogram()[60:])
+
+        got = mine.crop((0, strip, mine.width, mine.height)).crop(box)
+        expect("значки: проверка осмысленна (со шрифтом сайта и без него значок выглядит по-разному)",
+               strong(reference.crop(box), fallback.crop(box)) > 150, strong(reference.crop(box), fallback.crop(box)))
+        expect("значки: на первом же снимке значок нарисован шрифтом сайта, как на настоящем снимке экрана",
+               "✔ Готово" in final and mine.size == (1920, reference.height + strip) and strong(got, reference.crop(box)) <= 10,
+               (final[:60], mine.size, strong(got, reference.crop(box)), strong(got, fallback.crop(box))))
+        expect("значки: файлы шрифта в форматах, которые браузер не использует (.eot, .svg), помощник не запрашивает",
+               not [u for u in site.font_calls if not u.endswith(".ttf")], site.font_calls)
+        expect("значки: страница без ошибок", not page.errors, page.errors[:3])
+        site.icon_font = None
+        page.close()
 
     # ---------- 4. несколько реестров: один снимок на ИИН ----------
     site.calls.clear()
@@ -451,9 +828,9 @@ with sync_playwright() as p:
     expect("ошибка 500: три попытки, ссылки нет, причина записана", [c[1] for c in site.calls].count(C) == 3 and ws["D4"].hyperlink is None
            and str(ws["E4"].value).startswith("ОШИБКА: Восстановление платежеспособности:"), ws["E4"].value)
     expect("фильтр не применён: это ошибка, а не «не найден»", ws["D5"].hyperlink is None and "не применил фильтр" in str(ws["E5"].value), ws["E5"].value)
-    wide = Image.open(io.BytesIO(tree["tazalau_screenshots/д/снимок.png"]))
+    wide = Image.open(io.BytesIO(tree["д/снимок.png"]))
     expect("широкая таблица: снимок расширен, ничего не обрезано", wide.width > 2600 and "шире снимка" not in str(ws["E6"].value), (wide.size, ws["E6"].value))
-    normal = Image.open(io.BytesIO(tree["tazalau_screenshots/а/снимок.png"]))
+    normal = Image.open(io.BytesIO(tree["а/снимок.png"]))
     expect("широкая таблица: остальные снимки обычной ширины", normal.width == 1920, normal.size)
     expect("сбои: итог с числом ошибок", "ошибок 2" in final and "найдено 0 · не найдено 3" in final, final)
 
@@ -529,12 +906,12 @@ with sync_playwright() as p:
         expect("книга: новые столбцы сразу за таблицей", [ws.cell(3, c).value for c in (6, 7)] == ["tazalau_file_location", "tazalau_result"],
                [ws.cell(3, c).value for c in range(1, 9)])
         expect("книга: прежние ссылки на месте", ws["D4"].hyperlink.target.endswith("Снимок.JPG") and ws["D4"].value == "Снимок.JPG")
-        expect("книга: новая ссылка рядом, а не вместо", ws["F4"].hyperlink.target == "tazalau_screenshots/первый/снимок.png")
+        expect("книга: новая ссылка рядом, а не вместо", ws["F4"].hyperlink.target == "первый/снимок.png")
         expect("книга: таблица, формула, примечание, закрепление не тронуты", list(ws.tables.values())[0].ref == "A3:E6"
                and ws["C8"].value == "=SUM(C4:C6)" and ws["A4"].comment is not None and ws["C4"].number_format == "#,##0.00"
                and ws.freeze_panes == "A4" and wb["карты"]["C1"].value == 42)
         expect("книга: скрытая строка осталась скрытой и обработана", ws.row_dimensions[6].hidden and ws["F6"].hyperlink is not None)
-        expect("книга: числа с потерянными нулями", ws["F6"].hyperlink.target == "tazalau_screenshots/третий/снимок.png"
+        expect("книга: числа с потерянными нулями", ws["F6"].hyperlink.target == "третий/снимок.png"
                and [c[1] for c in site.calls].count(C) == 1, site.calls)
         (temp / "книга.xlsx").write_bytes(tree["отчет.xlsx"])
         desk = ExcelBook.open(temp / "книга.xlsx", Settings())
