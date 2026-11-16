@@ -1,0 +1,5 @@
+# Для разработчика: тесты и сборка комплекта для Windows
+-r requirements.txt
+pytest>=8.0
+markdown>=3.5
+pyinstaller>=6.6

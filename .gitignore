@@ -1,0 +1,22 @@
+# Никогда не попадает в репозиторий: фотографии экранов, рабочие книги Excel, снимки и журналы
+*.jpeg
+*.jpg
+*.png
+*.xlsx
+*.xlsm
+*.csv
+!пример.xlsx
+tazalau_screenshots/
+tazalau_backup/
+tazalau_config.json
+tazalau_startup_error.log
+
+# Сборка и служебное
+dist_windows/
+.cache_windows/
+build/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store

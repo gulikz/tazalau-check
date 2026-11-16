@@ -1,0 +1,108 @@
+# Проверка и сборка на настоящей Windows.
+# Собранный комплект можно скачать со страницы запуска (раздел Artifacts).
+name: Windows
+
+# Запуск только вручную (вкладка Actions - Windows - Run workflow, либо `gh workflow run windows.yml`):
+# пока в учётной записи запуски не стартуют, автоматический запуск слал бы письмо об ошибке на каждую отправку.
+on:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Тесты и переносимый комплект
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"                 # вывод с кириллицей в журнале сборки
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Установка
+        run: python -m pip install -r requirements-dev.txt xlsxwriter
+
+      - name: Тесты без сети
+        run: python -m pytest -q
+
+      - name: Тесты окна программы
+        run: python -m pytest -q -m gui
+
+      - name: Браузеры Windows под управлением программы (Edge, Chrome)
+        run: python tools/ci_browser_check.py msedge chrome
+
+      - name: Тесты на настоящем сайте (может быть недоступен с адресов GitHub)
+        id: live
+        continue-on-error: true
+        run: python -m pytest -q -m live
+
+      - name: Сборка переносимого комплекта и дополнения с браузером
+        run: python tools/make_windows_package.py --browser-addon
+
+      # Дальше работает уже не Python сборщика, а Python из самого комплекта — то, что получат коллеги.
+      - name: Комплект — тесты без сети его собственным Python
+        shell: cmd
+        run: |
+          python -m pip install --quiet --target "%RUNNER_TEMP%\testdeps" pytest xlsxwriter
+          set "PYTHONPATH=%RUNNER_TEMP%\testdeps"
+          dist_windows\TazalauCheck\python\python.exe -s -m pytest -q -p no:cacheprovider
+
+      - name: Комплект — тесты окна (tkinter из комплекта)
+        shell: cmd
+        run: |
+          set "PYTHONPATH=%RUNNER_TEMP%\testdeps"
+          dist_windows\TazalauCheck\python\python.exe -s -m pytest -q -p no:cacheprovider -m gui
+
+      - name: Комплект — Edge и Chrome под управлением его Python
+        shell: cmd
+        run: dist_windows\TazalauCheck\python\python.exe -E -s tools\ci_browser_check.py msedge chrome
+
+      - name: Комплект — «Проверка связи» (браузер + сайт)
+        id: selftest
+        continue-on-error: true
+        shell: cmd
+        run: dist_windows\TazalauCheck\python\python.exe -E -s dist_windows\TazalauCheck\app\tazalau_app.py --selftest
+
+      - name: Комплект — полный прогон на образце через командную строку
+        id: sample
+        continue-on-error: true
+        shell: cmd
+        run: |
+          copy "dist_windows\TazalauCheck\пример.xlsx" "%RUNNER_TEMP%\sample.xlsx"
+          dist_windows\TazalauCheck\python\python.exe -E -s dist_windows\TazalauCheck\app\tazalau_app.py --xlsx "%RUNNER_TEMP%\sample.xlsx"
+          dir "%RUNNER_TEMP%\tazalau_screenshots"
+
+      - name: Комплект — окно запускается через pythonw.exe и не падает
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist_windows\TazalauCheck\python\pythonw.exe" -ArgumentList '-E','-s','dist_windows\TazalauCheck\app\tazalau_app.py' -PassThru
+          Start-Sleep -Seconds 12
+          if ($p.HasExited) { Write-Error "Окно закрылось само, код $($p.ExitCode)"; if (Test-Path dist_windows\TazalauCheck\app\tazalau_startup_error.log) { Get-Content dist_windows\TazalauCheck\app\tazalau_startup_error.log }; exit 1 }
+          Stop-Process -Id $p.Id -Force
+          if (Test-Path dist_windows\TazalauCheck\app\tazalau_startup_error.log) { Get-Content dist_windows\TazalauCheck\app\tazalau_startup_error.log; exit 1 }
+          Write-Host "Окно программы открылось и работало 12 секунд."
+
+      - name: Дополнение — встроенный Chromium запускается
+        shell: pwsh
+        run: |
+          Expand-Archive -Path dist_windows\TazalauCheck_Windows_browser_addon.zip -DestinationPath "$env:RUNNER_TEMP\with_addon"
+          Copy-Item -Recurse dist_windows\TazalauCheck\* "$env:RUNNER_TEMP\with_addon\TazalauCheck\"
+          Copy-Item tools\ci_browser_check.py "$env:RUNNER_TEMP\with_addon\TazalauCheck\app\"
+          & "$env:RUNNER_TEMP\with_addon\TazalauCheck\python\python.exe" -E -s -c "import sys, runpy; sys.path.insert(0, r'$env:RUNNER_TEMP\with_addon\TazalauCheck\app'); sys.argv = ['check', 'chromium']; runpy.run_path(r'$env:RUNNER_TEMP\with_addon\TazalauCheck\app\ci_browser_check.py', run_name='__main__')"
+
+      - name: Итог проверок, зависящих от доступности сайта
+        shell: pwsh
+        run: |
+          Write-Host "Тесты на сайте:      ${{ steps.live.outcome }}"
+          Write-Host "Проверка связи:      ${{ steps.selftest.outcome }}"
+          Write-Host "Прогон на образце:   ${{ steps.sample.outcome }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TazalauCheck_Windows
+          path: |
+            dist_windows/TazalauCheck_Windows.zip
+            dist_windows/TazalauCheck_Windows_browser_addon.zip
+          if-no-files-found: error
