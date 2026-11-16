@@ -12,6 +12,8 @@ tazalau_config.json
 tazalau_startup_error.log
 
 # Сборка и служебное
+helper/_dev/out/
+helper/_dev/tazalau_helper.min.js
 dist_windows/
 .cache_windows/
 build/

@@ -3,9 +3,22 @@
 Проверка ИИН по открытым реестрам [tazalau.qoldau.kz](https://tazalau.qoldau.kz/ru/info)
 со снимком страницы и записью ссылки на снимок в Excel.
 
-## Скачать для Windows
+## Без установки: закладка в браузере (для рабочего компьютера)
 
-**[TazalauCheck_Windows.zip](https://github.com/gulikz/tazalau-check/releases/latest/download/TazalauCheck_Windows.zip)**
+**[Tazalau_helper.html](https://github.com/gulikz/tazalau-check/releases/latest/download/Tazalau_helper.html)**
+(он же в папке [helper](helper/Tazalau_helper.html)). Один файл, ничего не устанавливается и не запускается:
+помощник работает прямо во вкладке сайта, как закладка браузера. Подходит там, где программы и файлы `.bat` запрещены.
+
+1. Откройте скачанный файл в Edge или Chrome и перетащите кнопку **Tazalau ▶** на панель избранного.
+2. Откройте [tazalau.qoldau.kz](https://tazalau.qoldau.kz/ru/list/bankruptcy/recovery) и нажмите эту закладку.
+3. Нажмите **Папка с Excel**, выберите папку с файлом (в нём столбец `ИИН/БИН`), затем **Старт**.
+
+Снимки появятся в папке `tazalau_screenshots` рядом с файлом, ссылки и итог запишутся в сам файл Excel
+(перед записью делается копия в `tazalau_backup`).
+
+## Комплект для Windows (если на компьютере разрешён запуск программ)
+
+**[TazalauCheck_Windows.zip](https://github.com/gulikz/tazalau-check/releases/download/v1.0.0/TazalauCheck_Windows.zip)**
 — готовый комплект. Установка, права администратора и Python не нужны; нужен только
 Microsoft Edge или Google Chrome на компьютере.
 
@@ -16,7 +29,7 @@ Microsoft Edge или Google Chrome на компьютере.
    (или [ИНСТРУКЦИЯ.md](ИНСТРУКЦИЯ.md) здесь).
 
 Если «Проверка связи» пишет, что браузер не удалось запустить, скачайте ещё
-[дополнение со встроенным браузером](https://github.com/gulikz/tazalau-check/releases/latest/download/TazalauCheck_Windows_browser_addon.zip)
+[дополнение со встроенным браузером](https://github.com/gulikz/tazalau-check/releases/download/v1.0.0/TazalauCheck_Windows_browser_addon.zip)
 и распакуйте его в ту же папку, где лежит папка `TazalauCheck`.
 
 Все выпуски — на странице [Releases](https://github.com/gulikz/tazalau-check/releases).
