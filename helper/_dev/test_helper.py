@@ -274,13 +274,14 @@ with sync_playwright() as p:
     expect("файл: итог", "✔ Готово" in final and "Проверено 3 из 3 · найдено 1 · не найдено 2" in final and "Ссылок записано: 4" in final, final)
     expect("файл: один запрос на ИИН, дубль не запрашивается", [c[1] for c in site.calls] == [A, B, "000000000000"], site.calls)
     expect("файл: три снимка и копия книги", len(pngs) == 3 and "отчет_tazalau.xlsx" in got, sorted(got))
-    expect("файл: имя снимка начинается с ИИН (ведущие нули на месте)", any(n.startswith(B + "_") for n in pngs), pngs)
+    expect("файл: в «Загрузках» снимок называется «ФИО снимок.png»", pngs == ["второй снимок.png", "первый снимок.png", "третий снимок.png"], pngs)
     wb = check_xlsx("файл", original, got["отчет_tazalau.xlsx"])
     ws = wb["восстановление"]
     expect("файл: заголовки столбцов", (ws["D1"].value, ws["E1"].value) == ("tazalau_file_location", "tazalau_result"))
     expect("файл: заголовки оформлены как соседние", ws["D1"].font.b and ws["D1"].fill.fgColor.rgb.endswith("C6E0B4"))
     link = ws["D2"].hyperlink
-    expect("файл: ссылка ведёт на снимок рядом с книгой", link and link.target in pngs and ws["D2"].value == link.target, link and link.target)
+    expect("файл: ссылка ведёт на снимок рядом с книгой", link and urllib.parse.unquote(link.target) == "первый снимок.png"
+           and ws["D2"].value == "первый снимок.png", link and link.target)
     expect("файл: ссылка синяя и подчёркнутая", ws["D2"].font.color.rgb.endswith("0563C1") and ws["D2"].font.underline == "single")
     expect("файл: дубль ссылается на тот же снимок", ws["D4"].hyperlink.target == link.target)
     expect("файл: найден / не найден", str(ws["E2"].value).startswith("НАЙДЕН: Восстановление платежеспособности, записей: 1 · проверено")
@@ -289,7 +290,7 @@ with sync_playwright() as p:
            and ws["E5"].value == "ОШИБКА: контрольная цифра ИИН не сходится (вероятно, опечатка)", ws["E5"].value)
     expect("файл: прежние ячейки не тронуты", ws["B2"].value == A and ws["B3"].value == int(B) and ws["A2"].fill.fgColor.rgb.endswith("FFFF00"))
     expect("файл: в текстах нет длинных тире", "—" not in panel + final + "".join(str(c.value) for row in ws.iter_rows() for c in row))
-    shot = Image.open(io.BytesIO(got[[n for n in pngs if n.startswith(A)][0]])).convert("RGB")
+    shot = Image.open(io.BytesIO(got["первый снимок.png"])).convert("RGB")
     expect("снимок: ширина 1920, сверху полоса-подпись", shot.width == 1920 and shot.height > 1000 and shot.getpixel((3, 3)) == (36, 52, 71), shot.size)
     expect("снимок: не пустой", len(shot.getcolors(maxcolors=1 << 22) or range(999)) > 20)
     strip = shot.height - 1000
@@ -312,7 +313,8 @@ with sync_playwright() as p:
     shots = sorted(n for n in tree if n.startswith("tazalau_screenshots/") and n.endswith(".png"))
     backups = [n for n in tree if n.startswith("tazalau_backup/")]
     expect("папка: итог", "✔ Готово" in final and "найдено 1 · не найдено 3" in final and "Ссылок записано: 5" in final, final)
-    expect("папка: снимки в подпапке", len(shots) == 4, sorted(tree))
+    expect("папка: у каждого человека своя папка, в ней «снимок.png»", shots == [
+        f"tazalau_screenshots/{name}/снимок.png" for name in ("второй", "первый", "третий", "четвёртый")], shots)
     expect("папка: резервная копия совпадает с исходным файлом байт в байт", len(backups) == 1 and tree[backups[0]] == original, backups)
     expect("папка: журнал сохранён рядом со снимками", any(re.match(r"tazalau_screenshots/журнал_tazalau_.*\.csv$", n) for n in tree), sorted(tree))
     patched = tree["отчет по банкротству.xlsx"]
@@ -344,15 +346,73 @@ with sync_playwright() as p:
     page.get_by_text("Все заново").click()
     page.wait_for_function(DONE)
     tree = opfs_tree(page, "work")
-    expect("повтор «все заново»: новые снимки, старые на месте",
-           len([n for n in tree if n.startswith("tazalau_screenshots/") and n.endswith(".png")]) >= 4 and len(site.calls) == calls_before + 4,
-           (len(site.calls), calls_before))
+    again = sorted(n for n in tree if n.startswith("tazalau_screenshots/первый/") and n.endswith(".png"))
+    expect("повтор «все заново»: «снимок.png» свежий, прежний остался с датой в имени",
+           len(again) == 2 and again[0] == "tazalau_screenshots/первый/снимок.png"
+           and re.fullmatch(r"tazalau_screenshots/первый/снимок_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.png", again[1])
+           and len(site.calls) == calls_before + 4, (again, len(site.calls), calls_before))
     wb2 = check_xlsx("повтор", original, tree["отчет по банкротству.xlsx"])
     rels = zipfile.ZipFile(io.BytesIO(tree["отчет по банкротству.xlsx"])).read("xl/worksheets/_rels/sheet1.xml.rels").decode()
     sheet_xml = zipfile.ZipFile(io.BytesIO(tree["отчет по банкротству.xlsx"])).read("xl/worksheets/sheet1.xml").decode()
     expect("повтор: ссылки заменены, а не удвоены", rels.count("relationships/hyperlink") == 5 and sheet_xml.count("<hyperlink ") == 5,
            (rels.count("relationships/hyperlink"), sheet_xml.count("<hyperlink ")))
     expect("папка: страница без ошибок", not page.errors, page.errors[:3])
+    page.close()
+
+    # ---------- 3а. папки по столбцу FIO ----------
+    site.calls.clear()
+    site.found = {}
+    page = open_helper(ctx, site, {"width": 1366, "height": 768})
+
+    def fio_book(header, people):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ИИН"
+        ws.append([header, "ИИН/БИН", "tazalau_file_location"] if header else ["ИИН/БИН", "tazalau_file_location"])
+        for name, iin in people:
+            ws.append([name, iin] if header else [iin])
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        return buffer.getvalue()
+
+    people = [("ИВАНОВ ИВАН ИВАНОВИЧ", A), ("Иванов Иван Иванович", int(B)),      # однофамильцы: разные ИИН
+              ("Петров Пётр", int(C)), ("Петров Пётр", int(C)),                   # один человек в двух строках
+              (None, D),                                                           # имя не указано
+              ('ТОО "Ромашка": филиал/отдел №1?', E)]                               # знаки, недопустимые в имени папки
+    original = fio_book("FIO", people)
+    opfs_put(page, "iin.xlsx", original, "fio")
+    use_folder(page, "fio")
+    expect("FIO: помощник сообщает, что папки будут по столбцу FIO", "Папки снимков: по столбцу FIO" in page.inner_text("body"))
+    final = run_and_wait(page)
+    tree = opfs_tree(page, "fio")
+    folders = sorted({n.split("/")[1] for n in tree if n.startswith("tazalau_screenshots/") and n.endswith(".png")})
+    expect("FIO: папка на человека, однофамильцам добавлен ИИН, без имени: по ИИН, лишние знаки убраны", folders == sorted([
+        f"ИВАНОВ ИВАН ИВАНОВИЧ {A}", f"Иванов Иван Иванович {B}", "Петров Пётр", D, "ТОО Ромашка филиал отдел №1"]), folders)
+    expect("FIO: в каждой папке один файл «снимок.png»", sorted(n for n in tree if n.endswith(".png")) == sorted(
+        f"tazalau_screenshots/{f}/снимок.png" for f in folders), sorted(n for n in tree if n.endswith(".png")))
+    ws = check_xlsx("FIO", original, tree["iin.xlsx"])["ИИН"]
+    expect("FIO: столбцы на месте, результат добавлен", [ws.cell(1, c).value for c in range(1, 5)] == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result"])
+    expect("FIO: ссылка ведёт в папку человека (пробелы в адресе закодированы)",
+           ws["C2"].hyperlink.target == f"tazalau_screenshots/ИВАНОВ%20ИВАН%20ИВАНОВИЧ%20{A}/снимок.png"
+           and ws["C2"].value == f"tazalau_screenshots\\ИВАНОВ ИВАН ИВАНОВИЧ {A}\\снимок.png", (ws["C2"].hyperlink.target, ws["C2"].value))
+    expect("FIO: адрес ссылки после раскодирования совпадает с настоящим файлом",
+           all(urllib.parse.unquote(ws.cell(r, 3).hyperlink.target) in tree for r in range(2, 8)),
+           [ws.cell(r, 3).hyperlink.target for r in range(2, 8)])
+    expect("FIO: один человек в двух строках: один запрос, одна папка, две ссылки",
+           [c[1] for c in site.calls].count(C) == 1 and ws["C4"].hyperlink.target == ws["C5"].hyperlink.target == "tazalau_screenshots/Петров%20Пётр/снимок.png")
+    for header in ("ФИО", "Ф.И.О.", "fio"):
+        opfs_put(page, "iin.xlsx", fio_book(header, [("Сидоров Сидор", A)]), "fio_" + header.replace(".", ""))
+        use_folder(page, "fio_" + header.replace(".", ""))
+        run_and_wait(page)
+        expect(f"FIO: заголовок «{header}» тоже подходит",
+               "tazalau_screenshots/Сидоров Сидор/снимок.png" in opfs_tree(page, "fio_" + header.replace(".", "")))
+    opfs_put(page, "iin.xlsx", fio_book(None, [(None, A), (None, int(B))]), "nofio")
+    use_folder(page, "nofio")
+    expect("без FIO: помощник предупреждает, что папки будут по ИИН", "Столбца FIO нет: папки снимков по ИИН" in page.inner_text("body"))
+    run_and_wait(page)
+    expect("без FIO: папки называются по ИИН", sorted(n for n in opfs_tree(page, "nofio") if n.endswith(".png")) == sorted(
+        f"tazalau_screenshots/{i}/снимок.png" for i in (A, B)))
+    expect("FIO: страница без ошибок", not page.errors, page.errors[:3])
     page.close()
 
     # ---------- 4. несколько реестров: один снимок на ИИН ----------
@@ -391,9 +451,9 @@ with sync_playwright() as p:
     expect("ошибка 500: три попытки, ссылки нет, причина записана", [c[1] for c in site.calls].count(C) == 3 and ws["D4"].hyperlink is None
            and str(ws["E4"].value).startswith("ОШИБКА: Восстановление платежеспособности:"), ws["E4"].value)
     expect("фильтр не применён: это ошибка, а не «не найден»", ws["D5"].hyperlink is None and "не применил фильтр" in str(ws["E5"].value), ws["E5"].value)
-    wide = Image.open(io.BytesIO(tree[[n for n in tree if n.startswith("tazalau_screenshots/" + E)][0]]))
+    wide = Image.open(io.BytesIO(tree["tazalau_screenshots/д/снимок.png"]))
     expect("широкая таблица: снимок расширен, ничего не обрезано", wide.width > 2600 and "шире снимка" not in str(ws["E6"].value), (wide.size, ws["E6"].value))
-    normal = Image.open(io.BytesIO(tree[[n for n in tree if n.startswith("tazalau_screenshots/" + A)][0]]))
+    normal = Image.open(io.BytesIO(tree["tazalau_screenshots/а/снимок.png"]))
     expect("широкая таблица: остальные снимки обычной ширины", normal.width == 1920, normal.size)
     expect("сбои: итог с числом ошибок", "ошибок 2" in final and "найдено 0 · не найдено 3" in final, final)
 
@@ -469,12 +529,13 @@ with sync_playwright() as p:
         expect("книга: новые столбцы сразу за таблицей", [ws.cell(3, c).value for c in (6, 7)] == ["tazalau_file_location", "tazalau_result"],
                [ws.cell(3, c).value for c in range(1, 9)])
         expect("книга: прежние ссылки на месте", ws["D4"].hyperlink.target.endswith("Снимок.JPG") and ws["D4"].value == "Снимок.JPG")
-        expect("книга: новая ссылка рядом, а не вместо", ws["F4"].hyperlink.target.startswith("tazalau_screenshots/" + A))
+        expect("книга: новая ссылка рядом, а не вместо", ws["F4"].hyperlink.target == "tazalau_screenshots/первый/снимок.png")
         expect("книга: таблица, формула, примечание, закрепление не тронуты", list(ws.tables.values())[0].ref == "A3:E6"
                and ws["C8"].value == "=SUM(C4:C6)" and ws["A4"].comment is not None and ws["C4"].number_format == "#,##0.00"
                and ws.freeze_panes == "A4" and wb["карты"]["C1"].value == 42)
         expect("книга: скрытая строка осталась скрытой и обработана", ws.row_dimensions[6].hidden and ws["F6"].hyperlink is not None)
-        expect("книга: числа с потерянными нулями", ws["F6"].hyperlink.target.startswith("tazalau_screenshots/" + C))
+        expect("книга: числа с потерянными нулями", ws["F6"].hyperlink.target == "tazalau_screenshots/третий/снимок.png"
+               and [c[1] for c in site.calls].count(C) == 1, site.calls)
         (temp / "книга.xlsx").write_bytes(tree["отчет.xlsx"])
         desk = ExcelBook.open(temp / "книга.xlsx", Settings())
         expect("книга: настольная программа читает её так же", desk.use_sheet().link_col == 6 and all(t.has_link for t in desk.read_tasks()))

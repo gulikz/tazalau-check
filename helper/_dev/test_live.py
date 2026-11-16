@@ -98,7 +98,9 @@ with sync_playwright() as p:
     sheet = load_workbook(io.BytesIO(patched))["восстановление"]
     expect("ссылки и итог записаны в книгу", all(sheet.cell(r, 3).hyperlink for r in range(2, 2 + len(rows)))
            and str(sheet["D2"].value).startswith("НЕ НАЙДЕН: Восстановление платежеспособности"), sheet["D2"].value)
-    expect("число с потерянными нулями восстановлено", sheet["C3"].hyperlink.target.startswith("tazalau_screenshots/" + FAKE))
+    expect("папка названа по столбцу ФИО, снимок называется «снимок.png»",
+           sheet["C3"].hyperlink.target == "tazalau_screenshots/потерянные%20нули/снимок.png"
+           and "tazalau_screenshots/потерянные нули/снимок.png" in tree, sheet["C3"].hyperlink.target)
     if KNOWN:
         expect("известный ИИН найден", str(sheet["D4"].value).startswith("НАЙДЕН:"), sheet["D4"].value)
     expect("в окне помощника нет ошибок", not errors, errors[:3])
@@ -112,7 +114,7 @@ with sync_playwright() as p:
     real.wait_for_function("() => !document.body.classList.contains('loading') && document.fonts.status === 'loaded'", timeout=30000)
     real.wait_for_timeout(700)
     reference = Image.open(io.BytesIO(real.screenshot(full_page=True))).convert("RGB")
-    mine = Image.open(io.BytesIO(tree[[n for n in shots if n.startswith("tazalau_screenshots/" + target)][0]])).convert("RGB")
+    mine = Image.open(io.BytesIO(tree[f"tazalau_screenshots/{'известный' if KNOWN else 'нет такого'}/снимок.png"])).convert("RGB")
     strip = mine.height - reference.height
     expect("снимок: ширина 1920 и полоса-подпись сверху", mine.width == 1920 and strip > 40 and mine.getpixel((3, 3)) == (36, 52, 71),
            (mine.size, reference.size))

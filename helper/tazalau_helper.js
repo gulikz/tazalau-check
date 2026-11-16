@@ -1,11 +1,12 @@
-/* Tazalau помощник: версия 1.
+/* Tazalau помощник: версия 2.
    Закладка для tazalau.qoldau.kz (Edge или Chrome). Ничего не устанавливает.
    По файлу Excel (столбец «ИИН/БИН»): открывает реестр с фильтром по ИИН, проверяет, что на странице
    именно результат поиска, сохраняет снимок страницы и пишет ссылку на него в столбец tazalau_file_location.
+   Снимок каждого человека лежит в своей папке с именем из столбца FIO и называется «снимок.png».
    Вход на сайт и ЭЦП не нужны. Файл Excel читается и изменяется только внутри браузера и никуда не отправляется. */
 (() => {
   'use strict';
-  const VERSION = '1';
+  const VERSION = '2';
   if (window.__tazalau) { window.__tazalau.show(); return; }
   if (!/(^|\.)tazalau\.qoldau\.kz$/i.test(location.hostname)) {
     const check = document.getElementById('tazalau-check');
@@ -55,11 +56,13 @@
   const LINK_HEADER = 'tazalau_file_location';
   const RESULT_HEADER = 'tazalau_result';
   const SHOTS_DIR = 'tazalau_screenshots';
+  const SHOT_NAME = 'снимок.png';      /* так называется снимок в папке каждого человека */
   const BACKUP_DIR = 'tazalau_backup';
   /* ========================================================= */
 
   const START_URL = location.origin + REGISTRIES[0].path;
   const IIN_HEADERS = ['иин/бин', 'бин/иин', 'иин', 'iin/bin', 'iin'];
+  const FIO_HEADERS = ['fio', 'фио', 'fullname', 'full_name'];     /* столбец с именем человека: из него имя папки */
   const COLORS = { 'НАЙДЕН': '#1a7f37', 'НЕ НАЙДЕН': '#1d2433', 'ОШИБКА': '#cf222e', 'НЕВЕРНЫЙ ИИН': '#b35900' };
 
   /* Таймер в отдельном потоке (Worker): если окно свёрнуто или закрыто другими окнами, браузер
@@ -367,11 +370,12 @@
       }
     }
     if (!best) return null;
-    const L = { headerRow: best.row, iinCol: best.col, linkCol: 0, resultCol: 0, lastRow: best.row };
+    const L = { headerRow: best.row, iinCol: best.col, fioCol: 0, linkCol: 0, resultCol: 0, lastRow: best.row };
     for (const [c, el] of S.cells.get(best.row)) {
       const x = cellValue(S, el), name = x && x.v != null ? normHead(x.v) : '';
       if (name === LINK_HEADER && (!L.linkCol || c < L.linkCol)) L.linkCol = c;
       if (name === RESULT_HEADER && (!L.resultCol || c < L.resultCol)) L.resultCol = c;
+      if (FIO_HEADERS.includes(name.replace(/\./g, '')) && (!L.fioCol || c < L.fioCol)) L.fioCol = c;
     }
     for (const [r, map] of S.cells) {
       if (r <= best.row) continue;
@@ -392,7 +396,9 @@
         : normIin(x.v, x.num);
       if (!parse) continue;
       const row = S.rows.get(r);
-      tasks.push({ row: r, parse, raw: x.formula ? '' : x.v, hasLink: !!L.linkCol && linked(r, L.linkCol),
+      let fio = L.fioCol ? clean(textAt(S, r, L.fioCol)) : '';
+      if (/^(#N\/A|#Н\/Д|-+|нет|n\/a|null|none)$/i.test(fio)) fio = '';       /* заглушка вместо имени: имени нет */
+      tasks.push({ row: r, parse, fio, raw: x.formula ? '' : x.v, hasLink: !!L.linkCol && linked(r, L.linkCol),
         hidden: !!row && /^(1|true)$/.test(row.getAttribute('hidden') || '') });
     }
     return tasks;
@@ -591,7 +597,7 @@
   }
 
   /* Узкая полоса слева: файл, запуск, статус и журнал; справа: сайт (уменьшенный, чтобы помещался целиком) */
-  const root = h('div', 'position:fixed;inset:0;z-index:2147483647;display:flex;background:#fff;' +
+  const root = h('div', 'position:fixed;inset:0;z-index:2147483647;display:flex;background:#fff;visibility:visible;' +
     'font:13px/1.4 Arial,sans-serif;color:#1d2433;text-align:left');
   const panel = h('div', 'width:250px;min-width:250px;height:100%;overflow:auto;box-sizing:border-box;' +
     'padding:8px 10px;background:#f5f7fa;border-right:1px solid #d5dbe5');
@@ -710,6 +716,27 @@
     return { groups, invalid, linked, hiddenRows };
   }
 
+  /* Имя папки человека: ФИО из столбца FIO, а если его нет, ИИН. Знаки, недопустимые в именах папок Windows
+     (и «#», «%», с которыми Excel не открывает ссылки), заменяются пробелом. Однофамильцам с разными ИИН
+     к имени добавляется ИИН. Считается по всем строкам листа, поэтому имя одно и то же при любом запуске. */
+  const safeName = v => {
+    const t = clean(String(v || '').replace(/[\\/:*?"<>|#%\u0000-\u001f]/g, ' ')).slice(0, 100).replace(/[. ]+$/, '');
+    return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(t) ? '_' + t : t;
+  };
+  function folderNames() {
+    const fio = new Map(), count = new Map(), out = new Map();
+    for (const t of tasks) if (t.parse.iin && !fio.get(t.parse.iin)) fio.set(t.parse.iin, safeName(t.fio));
+    for (const [iin, name] of fio) { const key = (name || iin).toLowerCase(); count.set(key, (count.get(key) || 0) + 1); }
+    for (const [iin, name] of fio) out.set(iin, !name ? iin : count.get(name.toLowerCase()) > 1 ? name + ' ' + iin : name);
+    return out;
+  }
+  /* Прежний снимок не затирается: получает дату в имени, а «снимок.png» всегда самый свежий */
+  async function keepOld(dir) {
+    let old;
+    try { old = await (await dir.getFileHandle(SHOT_NAME)).getFile(); } catch (e) { return; }
+    await writeFile(dir, SHOT_NAME.replace(/\.png$/, '_' + stampOf(new Date(old.lastModified)) + '.png'), await old.arrayBuffer());
+  }
+
   function refresh() {
     const regs = chosen();
     regHead.textContent = 'Реестры: ' + (regs.length === 1 ? regs[0].short : regs.length ? regs.length + ' выбрано' : 'не выбрано');
@@ -718,6 +745,7 @@
     const skipped = [p.linked ? 'уже со ссылкой ' + p.linked : '', p.hiddenRows ? 'скрыто фильтром ' + p.hiddenRows : ''].filter(Boolean).join(', ');
     summary.textContent = book.fileName + ' · лист «' + S.sheet.name + '»\n' +
       'Строк с ИИН ' + tasks.length + (skipped ? ' · ' + skipped : '') + '\n' +
+      (S.layout.fioCol ? 'Папки снимков: по столбцу FIO' : 'Столбца FIO нет: папки снимков по ИИН') + '\n' +
       (p.groups.size ? 'К проверке: ' + p.groups.size + ' ИИН (строк ' + rows + '), примерно ' + eta(p.groups.size * Math.max(1, regs.length))
                      : (tasks.length ? 'Новых ИИН нет ✔ (Старт спросит, проверять ли заново)' : 'В столбце «ИИН/БИН» нет значений'));
     badBox.style.display = p.invalid.length ? 'block' : 'none';
@@ -859,7 +887,7 @@
       const active = sheetsWithIin.find(s => s.sheet.index === b.active) || sheetsWithIin[0];
       sheetSelect.value = active.sheet.name;
       useSheet(active.sheet.name);
-      say(handle ? 'Можно запускать. Снимки: папка ' + SHOTS_DIR + ', ссылки: прямо в файл.'
+      say(handle ? 'Можно запускать. Снимки: папка ' + SHOTS_DIR + ', в ней папка на каждого человека. Ссылки: прямо в файл.'
                  : 'Можно запускать. Снимки и копия файла со ссылками придут в «Загрузки».');
     } catch (e) { book = S = null; tasks = []; refresh(); say('❌ ' + (e.message || e)); }
   }
@@ -1309,6 +1337,7 @@
         try { setText(S, t.row, L.resultCol, 'ОШИБКА: ' + t.parse.err, null); } catch (e) { /* объединённая ячейка */ }
         logRow({ time: ruDate(new Date(), true), iin: clean(t.raw) || '?', rows: String(t.row), status: 'НЕВЕРНЫЙ ИИН', counts: '', file: '', note: t.parse.err });
       }
+      const names = folderNames();
       for (const [iin, rows] of p.groups) {
         if (stopping) break;
         say('Проверяю ' + (done + 1) + ' из ' + total + ': ' + iin + '\nнайдено ' + found + ' · не найдено ' + notFound + ' · ошибок ' + errors);
@@ -1320,15 +1349,23 @@
           logRow({ time: ruDate(new Date(), true), iin, rows: rows.join(', '), status: 'ОШИБКА', counts: '', file: '', note: res.error });
         } else {
           fails = 0;
-          const d = describe(res.shots), name = iin + '_' + stampOf(res.shots[res.shots.length - 1].at) + '.png';
+          const d = describe(res.shots), folder = names.get(iin) || iin;
           const blob = await stamped(res.shots);
-          if (store.shots) await writeFile(store.shots, name, blob); else saveBlob(blob, name);
-          const target = store.shots ? SHOTS_DIR + '/' + name : name;
+          let target;
+          if (store.shots) {                       /* папка человека, в ней «снимок.png» */
+            const personDir = await store.shots.getDirectoryHandle(folder, { create: true });
+            await keepOld(personDir);
+            await writeFile(personDir, SHOT_NAME, blob);
+            target = SHOTS_DIR + '/' + folder + '/' + SHOT_NAME;
+          } else {                                 /* в «Загрузки» папку создать нельзя: имя человека в начале имени файла */
+            target = folder + ' ' + (recheck ? SHOT_NAME.replace(/\.png$/, ' ' + stampOf(res.shots[res.shots.length - 1].at) + '.png') : SHOT_NAME);
+            saveBlob(blob, target);
+          }
           let note = '';
           for (const r of rows) {
             try {
               const cur = (S.cells.get(r) || new Map()).get(L.linkCol);
-              setText(S, r, L.linkCol, store.shots ? SHOTS_DIR + '\\' + name : name, await linkStyle(S, cur ? cur.getAttribute('s') : null));
+              setText(S, r, L.linkCol, target.replace(/\//g, '\\'), await linkStyle(S, cur ? cur.getAttribute('s') : null));
               await setLink(S, r, L.linkCol, target);
               setText(S, r, L.resultCol, d.text, null);
               written++;
@@ -1336,7 +1373,7 @@
           }
           if (d.found) found++; else notFound++;
           logRow({ time: ruDate(new Date(), true), iin, rows: rows.join(', '), status: d.found ? 'НАЙДЕН' : 'НЕ НАЙДЕН',
-            counts: res.shots.map(s => s.reg.key + '=' + s.count).join('; '), file: name, note });
+            counts: res.shots.map(s => s.reg.key + '=' + s.count).join('; '), file: target, note });
         }
         done++; unsaved++;
         if (fails >= MAX_FAILS) { stopNote = 'Сайт не отвечает: ' + fails + ' ИИН подряд не удалось проверить. Попробуйте позже.'; break; }
@@ -1354,7 +1391,7 @@
     say(headLine + '\nПроверено ' + done + ' из ' + total + ' · найдено ' + found + ' · не найдено ' + notFound +
       (errors ? ' · ошибок ' + errors : '') + (p.invalid.length ? '\nНеверных ИИН: ' + p.invalid.length : '') +
       '\nСсылок записано: ' + written + (store.handle ? '' : '\nФайлы пришли в «Загрузки»: держите их в одной папке.') +
-      (recheck ? '\nПроверка заново: прежние снимки остались в папке.' : ''));
+      (recheck ? '\nПроверка заново: прежние снимки остались в тех же папках, с датой в имени.' : ''));
     if (journal.length && store.shots) {
       try { await writeFile(store.shots, 'журнал_tazalau_' + stampOf(new Date()) + '.csv', csvBlob()); } catch (e) { /* журнал доступен кнопкой CSV */ }
     }
