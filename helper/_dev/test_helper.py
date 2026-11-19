@@ -4,11 +4,15 @@
 # Макет повторяет то, на что помощник опирается на настоящем сайте: <body class="loading"> с задержкой 0,4 с,
 # поле фильтра с ИИН, счётчик «Всего записей», таблицу результатов, страницу «Превышен лимит запросов» с кодом 200.
 import base64
+import datetime
 import html
 import io
 import json
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import urllib.parse
 import zipfile
 import xml.etree.ElementTree as ET
@@ -16,8 +20,12 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
+import docx                                                # python-docx: файл Word для проверки списков ДГД
 from PIL import Image, ImageChops
 from playwright.sync_api import sync_playwright
+from pypdf import PdfReader, PdfWriter
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas as rl_canvas
 
 DEV = Path(__file__).resolve().parent
 ROOT = DEV.parent.parent
@@ -58,6 +66,53 @@ def fake(prefix11):
 A, B, C, D, E = (fake(p) for p in ("99139990001", "00139990002", "05139990003", "77139990004", "66139990005"))
 
 
+def plausible(prefix7):
+    """Синтетический ИИН с правдоподобной датой рождения (для списков ДГД: там отбрасываются номера с невозможной датой)."""
+    for tail in range(1000, 10000):
+        body = prefix7 + str(tail)
+        if check_digit(body) is not None:
+            return body + str(check_digit(body))
+
+
+REGISTRY_ORDER = ("/ru/list/bankruptcy/recovery", "/ru/list/bankruptcy/judicial", "/ru/list/bankruptcy-and-insolvent",
+                  "/ru/list/debtor", "/ru/list/debtor/judicial", "/ru/list/debtor/extrajudicial/terminated-and-cancelled")
+
+
+# Заголовки таблиц результатов: как на настоящем сайте (сверено 20.11.2026), в том числе «Cумма» с латинской C
+JUDICIAL = ["ФИО должника", "Категория дела", "Дата Иска", "Дата передачи судье", "Дата принятия к производству", "Дата решения суда",
+            "Дата вступления в силу решения суда", "Дата завершения дела", "Наименование суда", "Регион", "Статус дела Torelik"]
+HEADS = {
+    "/ru/list/bankruptcy/recovery": JUDICIAL,
+    "/ru/list/bankruptcy/judicial": JUDICIAL + ["Статус дела Tazalau"],
+    "/ru/list/debtor/judicial": JUDICIAL,
+    "/ru/list/bankruptcy-and-insolvent": ["ФИО заявителя", "Услугодатель", "Входящий номер заявления",
+        "Дата подачи заявления от фронт системы на применение процедуры", "Дата начала процедуры внесудебного банкротства",
+        "Дата завершения процедуры внесудебного банкротства", "Статус заявителя", "Список кредиторов, указанный заявителем",
+        "Cумма задолженности, указанная заявителем, тг.", "Список кредиторов по данным кредитного бюро", "Cумма задолженности по кредитному бюро, тг."],
+    "/ru/list/debtor": ["ФИО заявителя", "Услугодатель", "Входящий номер заявления", "Дата подачи заявления от фронт системы на применение процедуры",
+        "Дата начала процедуры внесудебного банкротства", "Статус заявителя", "Список кредиторов, данные ПКБ/ГКБ", "Cумма задолженности, данные ПКБ/ГКБ, тг."],
+    "/ru/list/debtor/extrajudicial/terminated-and-cancelled": ["ФИО заявителя", "Услугодатель", "Входящий номер заявления",
+        "Дата подачи заявления от фронт системы на применение процедуры", "Дата начала процедуры внесудебного банкротства", "Инициатор процедуры",
+        "Дата прекращения процедуры внесудебного банкротства", "Входящий номер заявления на прекращение",
+        "Дата подачи заявления от фронт системы на прекращение процедуры", "Список кредиторов", "Cумма задолженности, указанная заявителем, тг."],
+}
+
+
+def default_value(head, path):
+    """Правдоподобное значение столбца для записи макета."""
+    rules = [(r"^ФИО", "ТЕСТ Т. Т."), (r"Категория", "Восстановление платежеспособности"), (r"Дата Иска|Дата передачи", "16.10.2026"),
+             (r"принятия к производству", "20.10.2026"), (r"Дата (решения|вступления|завершения дела)", ""),
+             (r"Наименование суда", "Тестовый городской суд"), (r"^Регион", "Алматы"), (r"Статус дела Torelik", "Дело на рассмотрении"),
+             (r"Статус дела Tazalau", "Судебное банкротство (тест)"), (r"Услугодатель", "Тестовый ЦОН"), (r"номер заявления", "202600000000001"),
+             (r"Дата подачи", "01.05.2026 10:00:00"), (r"Дата начала", "18.05.2026 15:00:00"), (r"Дата завершения процедуры", "19.11.2026 17:00:00"),
+             (r"Дата прекращения", "01.07.2026 12:00:00"), (r"Статус заявителя", "Банкрот" if "insolvent" in path else "Должник"),
+             (r"Инициатор", "Заявитель"), (r"Список кредиторов", '1) АО "Тестовый банк" 2) ТОО "Тестовое МФО"'), (r"умма", "1 234 567")]
+    for pattern, value in rules:
+        if re.search(pattern, head):
+            return value
+    return ""
+
+
 class Site:
     """Макет сайта: отвечает по таблице, считает обращения."""
 
@@ -67,6 +122,7 @@ class Site:
         self.fail = {}           # ИИН -> сколько раз ответить ошибкой 500 (-1 = всегда)
         self.wide = set()        # ИИН с очень широкой таблицей
         self.ignore = set()      # ИИН, для которых сайт «не применил фильтр»
+        self.records = {}        # (ИИН, путь реестра) -> [{заголовок: значение}]: свои значения записей вместо обычных
         self.icon_font = None    # файл шрифта: в меню появляется значок, нарисованный «значковым шрифтом сайта»
         self.font_calls = []
         self.calls = []
@@ -76,10 +132,14 @@ class Site:
         if isinstance(count, dict):
             count = count.get(path, 0)
         shown = "" if iin in self.ignore else iin
-        rows = "".join(f"<tr><td>ТЕСТ Т. {i + 1}</td><td>Восстановление платежеспособности</td><td>16.10.2026</td>"
-                       f"<td>Тестовый городской суд</td><td>Дело на рассмотрении</td></tr>" for i in range(min(count, 15)))
+        heads = HEADS.get(path, JUDICIAL)
+        custom = self.records.get((iin, path), [])
+        rows = ""
+        for i in range(min(count, 15)):
+            values = dict({h: default_value(h, path) for h in heads}, **(custom[i] if i < len(custom) else {}))
+            rows += "<tr>" + "".join(f"<td>{html.escape(values[h])}</td>" for h in heads) + "</tr>"
         if not count:
-            rows = '<tr><td colspan="5" class="text-center">Нет записей</td></tr>'
+            rows = f'<tr><td colspan="{len(heads)}" class="text-center">Нет записей</td></tr>'
         pager = f'<div class="text-nowrap"><span><small>Всего записей</small> {count}</span><ul class="pagination"><li>1</li></ul></div>'
         wide = "min-width:2600px;" if iin in self.wide else ""
         icons = '<link rel="stylesheet" href="/icons/style.css">' if self.icon_font else ""
@@ -95,8 +155,8 @@ class Site:
 <div class="left-side-menu"><b>TAZALAU</b><p>Реестры</p>{icon}</div>
 <div class="content-page"><h4 class="page-title">Список банкротов ({html.escape(path)})</h4>
 <form method="get"><div class="card"><label>ИИН</label><br><input type="text" name="{param}" value="{html.escape(shown)}"></div>
-{pager}<div class="card"><div class="table-responsive"><table class="table"><thead><tr><th>ФИО</th><th>Категория дела</th>
-<th>Дата иска</th><th>Наименование суда</th><th>Статус дела</th></tr></thead><tbody>{rows}</tbody></table></div></div>{pager}</form></div>
+{pager}<div class="card"><div class="table-responsive"><table class="table"><thead><tr>{"".join(f"<th>{html.escape(h)}</th>" for h in heads)}</tr></thead>
+<tbody>{rows}</tbody></table></div></div>{pager}</form></div>
 <script>setTimeout(function () {{ document.body.classList.remove('loading'); }}, 400);</script></body></html>"""
 
     def handle(self, route, request):
@@ -165,7 +225,8 @@ DONE = "() => /^(✔ Готово\\.|⏹ Остановлено\\.|❌ )/.test(d
 STATE = "() => document.querySelector('#tazalau-state').textContent"
 
 
-def open_helper(ctx, site, viewport=None, overrides=None):
+def open_helper(ctx, site, viewport=None, overrides=None, regs=("recovery",)):
+    """Помощник на макете сайта. regs: какие реестры отмечены (None: как у пользователя, все шесть)."""
     page = ctx.new_page()
     if viewport:
         page.set_viewport_size(viewport)
@@ -175,13 +236,15 @@ def open_helper(ctx, site, viewport=None, overrides=None):
     page.evaluate("cfg => { window.__tazalauTest = cfg; }", dict(FAST, **(overrides or {})))
     ctx.new_cdp_session(page).send("Page.navigate", {"url": HREF})        # как нажатие на закладку
     page.wait_for_function("() => !!window.__tazalau")
+    if regs is not None:
+        page.evaluate("keys => window.__tazalau.test.setRegs(keys)", list(regs))
     return page
 
 
 def opfs_put(page, name, data, folder=""):
     page.evaluate("""async ([folder, name, b64]) => {
         let dir = await navigator.storage.getDirectory();
-        if (folder) dir = await dir.getDirectoryHandle(folder, { create: true });
+        for (const part of folder ? folder.split('/') : []) dir = await dir.getDirectoryHandle(part, { create: true });
         const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
         await w.write(Uint8Array.from(atob(b64), c => c.charCodeAt(0)));
         await w.close();
@@ -378,8 +441,9 @@ with sync_playwright() as p:
     ws = wb["восстановление"]
     target = ws["D2"].hyperlink.target
     expect("папка: ссылка относительная, в папку человека", target in shots and ws["D2"].value == target.replace("/", "\\"), (target, ws["D2"].value))
-    expect("папка: без пути к папке столбец hyperlink не создаётся", [ws.cell(1, c).value for c in range(4, 7)] == ["tazalau_file_location", "tazalau_result", None],
-           [ws.cell(1, c).value for c in range(1, 7)])
+    expect("папка: без пути к папке столбец hyperlink не создаётся, статус и подробности добавлены",
+           [ws.cell(1, c).value for c in range(4, 9)] == ["tazalau_file_location", "tazalau_result", "tazalau_status", "tazalau_details", None],
+           [ws.cell(1, c).value for c in range(1, 9)])
     expect("папка: записей 2", "записей: 2" in str(ws["E2"].value), ws["E2"].value)
     temp = DEV / "out"
     temp.mkdir(exist_ok=True)
@@ -535,7 +599,8 @@ with sync_playwright() as p:
     final = run_and_wait(page)
     tree = opfs_tree(page, FOLDER)
     ws = check_xlsx("hyperlink", original, tree["iin.xlsx"])["ИИН"]
-    expect("hyperlink: столбец добавлен рядом со ссылкой", heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "tazalau_result", None], heads_of(ws))
+    expect("hyperlink: столбец добавлен рядом со ссылкой", heads_of(ws, 8) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "tazalau_result",
+           "tazalau_status", "tazalau_details", None], heads_of(ws, 8))
     full = BASE + "\\Иванов Иван Иванович\\снимок.png"
     expect("hyperlink: ссылка записана формулой с полным путём: папка на диске + папка человека + снимок.png",
            ws["D2"].value == '=HYPERLINK("' + full + '")' and ws["D2"].data_type == "f", ws["D2"].value)
@@ -581,7 +646,8 @@ with sync_playwright() as p:
     tree = opfs_tree(page, "manual")
     ws = check_xlsx("hyperlink вручную", original, tree["iin.xlsx"])["ИИН"]
     expect("hyperlink: готовый столбец заполнен, второй такой же не создан",
-           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "tazalau_result", None], heads_of(ws))
+           heads_of(ws, 8) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "tazalau_result", "tazalau_status", "tazalau_details", None],
+           heads_of(ws, 8))
     expect("hyperlink: путь, вставленный вручную", path_of(ws["D2"]) == r"W:\Отдел\manual\Сидоров Сидор\снимок.png"
            and shown(tree["iin.xlsx"], "D2") == r"W:\Отдел\manual\Сидоров Сидор\снимок.png"
            and ws["C2"].hyperlink.target == "Сидоров%20Сидор/снимок.png" and "Сидоров Сидор/снимок.png" in tree, ws["D2"].value)
@@ -620,8 +686,8 @@ with sync_playwright() as p:
            and '<hyperlink ref="D2"' not in sheet_xml and "old/1.png" not in rels and ws["E2"].hyperlink.target == "old/2.png"
            and ws["E2"].value == "заметка", (ws["D2"].value, rels))
     expect("hyperlink: формат «Текст» заменён на «Общий», результат записан за последним столбцом",
-           ws["D2"].number_format == "General" and heads_of(ws, 7) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "Заметки", "tazalau_result", None],
-           (ws["D2"].number_format, heads_of(ws, 7)))
+           ws["D2"].number_format == "General" and heads_of(ws, 9) == ["FIO", "ИИН/БИН", "tazalau_file_location", "hyperlink", "Заметки", "tazalau_result",
+           "tazalau_status", "tazalau_details", None], (ws["D2"].number_format, heads_of(ws, 9)))
 
     # (в) путь кончается другой папкой: предупреждение и вопрос; сетевой путь
     site.calls.clear()
@@ -660,7 +726,7 @@ with sync_playwright() as p:
     tree = opfs_tree(page, "decline")
     ws = check_xlsx("без hyperlink", original, tree["iin.xlsx"])["ИИН"]
     expect("hyperlink: «Без hyperlink»: проверка идёт, столбца нет, ответ запомнен в папке",
-           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", None, None]
+           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", "tazalau_status", "tazalau_details"]
            and ws["C2"].hyperlink.target == "Сидоров%20Сидор/снимок.png" and tree.get(SAVED, b"").decode("utf-8").strip() == "нет",
            (heads_of(ws), tree.get(SAVED)))
     use_folder(page, "decline", "keep")
@@ -728,7 +794,8 @@ with sync_playwright() as p:
     tree = opfs_tree(page, "слишком")
     ws = load_workbook(io.BytesIO(tree["iin.xlsx"]))["ИИН"]
     expect("путь к папке: с неверным путём столбец hyperlink не пишется, а неверный путь не запоминается как отказ",
-           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", None, None] and SAVED not in tree, (heads_of(ws), sorted(tree)))
+           heads_of(ws) == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", "tazalau_status", "tazalau_details"] and SAVED not in tree,
+           (heads_of(ws), sorted(tree)))
 
     # (ж) снимок одного человека не сохранился (на месте его папки лежит файл): ошибка только в его строке
     site.calls.clear()
@@ -791,6 +858,253 @@ with sync_playwright() as p:
         expect("значки: страница без ошибок", not page.errors, page.errors[:3])
         site.icon_font = None
         page.close()
+
+    # ---------- 3г. статусы: все шесть реестров, главный статус и подробности ----------
+    P_REC, P_JUD, P_EXT, P_DEB, P_DJ, P_TERM = REGISTRY_ORDER
+    site.calls.clear()
+    site.found = {A: {P_REC: 1, P_EXT: 1}, B: {P_TERM: 1}}
+    site.records = {(A, P_REC): [{"Дата Иска": "10.03.2026", "Статус дела Torelik": "Дело на рассмотрении"}],
+                    (A, P_EXT): [{"Статус заявителя": "Банкрот"}],
+                    (B, P_TERM): [{"ФИО заявителя": "ДРУГОВ Д. Д."}]}
+    page = open_helper(ctx, site, {"width": 1366, "height": 768}, regs=None)
+    page.locator("details", has_text="Реестры").locator("summary").click()
+    expect("статусы: по умолчанию отмечены все шесть реестров", "Реестры: 6 выбрано" in page.inner_text("body")
+           and all(page.get_by_label(t, exact=True).is_checked() for t in ("Восстановление платежеспособности", "Внесудебная процедура", "Процедура прекращена (объявления)")))
+    original = fio_book("FIO", [("Тест Тимур", A), ("Иванов Иван", int(B)), ("Петров Пётр", int(C))])
+    opfs_put(page, "iin.xlsx", original, "status")
+    use_folder(page, "status")
+    final = run_and_wait(page, timeout=240000)
+    tree = opfs_tree(page, "status")
+    ws = check_xlsx("статусы", original, tree["iin.xlsx"])["ИИН"]
+    heads = [ws.cell(1, c).value for c in range(1, 8)]
+    expect("статусы: столбцы итог, статус, подробности", heads == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", "tazalau_status", "tazalau_details", None], heads)
+    expect("статусы: каждый ИИН проверен во всех шести реестрах по порядку", [path for path, i in site.calls if i == A] == list(REGISTRY_ORDER)
+           and len(site.calls) == 18, ([path for path, i in site.calls if i == A], len(site.calls)))
+    expect("статусы: итог перечисляет реестры с записями", str(ws["D2"].value).startswith(
+        "НАЙДЕН: Восстановление платежеспособности, записей: 1; Внесудебное банкротство, записей: 1 · проверено"), ws["D2"].value)
+    expect("статусы: главный статус: самая свежая запись из всех реестров",
+           ws["E2"].value == "Внесудебное банкротство: Банкрот · процедура завершена 19.11.2026 (всего записей: 2)", ws["E2"].value)
+    details = str(ws["F2"].value)
+    expect("статусы: подробности по каждой записи: статус, даты, суд или услугодатель, кредиторы и суммы",
+           "Восстановление платежеспособности: Дело на рассмотрении · Восстановление платежеспособности · иск 10.03.2026, принято к производству 20.10.2026 · Алматы, Тестовый городской суд" in details
+           and 'Внесудебное банкротство: Банкрот · заявление подано 01.05.2026, начало процедуры 18.05.2026, процедура завершена 19.11.2026 · Тестовый ЦОН · кредиторы: 1) АО "Тестовый банк" 2) ТОО "Тестовое МФО"; сумма, тг: 1 234 567 / 1 234 567' in details,
+           details)
+    expect("статусы: прекращённая процедура и другая фамилия на сайте отмечены",
+           str(ws["E3"].value).startswith("Должники: процедура прекращена: процедура прекращена (инициатор: Заявитель) · процедура прекращена 01.07.2026")
+           and "внимание: на сайте фамилия «ДРУГОВ», в файле «Иванов»" in str(ws["F3"].value), (ws["E3"].value, ws["F3"].value))
+    expect("статусы: не найден нигде", str(ws["D4"].value).startswith("НЕ НАЙДЕН ни в одном из 6 реестров")
+           and ws["E4"].value == "нет записей ни в одном из проверенных реестров" and not ws["F4"].value, (ws["D4"].value, ws["E4"].value, ws["F4"].value))
+    tall = Image.open(io.BytesIO(tree["Тест Тимур/снимок.png"]))
+    expect("статусы: на одном снимке все шесть страниц друг под другом", tall.width == 1920 and tall.height > 6 * 1000, tall.size)
+    expect("статусы: в журнале статус найденного", any(r["iin"] == A and "Банкрот" in r["note"] for r in page.evaluate("() => window.__tazalau.test.state().journal")))
+    rule = page.evaluate("""() => {
+        const t = window.__tazalau.test, reg = { key: 'recovery', short: 'Восстановление платежеспособности' }, at = new Date();
+        const rec = (status, filed, done) => ({ 'Дата Иска': filed, 'Дата решения суда': done || '', 'Статус дела Torelik': status });
+        const shot = recs => ({ reg, count: recs.length, rows: recs.length, records: recs, at });
+        return [
+          t.describe([shot([rec('Исковое заявление возвращено', '05.10.2026', '23.10.2026'), rec('Дело на рассмотрении', '21.10.2026')])], '').status,
+          t.describe([shot([rec('Дело на рассмотрении', '01.03.2025'), rec('Отказано в принятии искового заявления', '01.11.2026', '05.11.2026')])], '').status,
+          t.describe([shot([rec('Дело на рассмотрении', '01.03.2025'), rec('Дело на рассмотрении', '01.11.2026')])], '').status,
+        ];
+    }""")
+    expect("статусы: главная запись: идущее дело важнее возвращённого или отклонённого иска, среди равных самое новое", rule == [
+        "Восстановление платежеспособности: Дело на рассмотрении · иск 21.10.2026 (всего записей: 2)",
+        "Восстановление платежеспособности: Дело на рассмотрении · иск 01.03.2025 (всего записей: 2)",
+        "Восстановление платежеспособности: Дело на рассмотрении · иск 01.11.2026 (всего записей: 2)"], rule)
+    expect("статусы: страница без ошибок", not page.errors, page.errors[:3])
+    site.records = {}
+    page.close()
+
+    # ---------- 3д. выгрузка ADW в CSV (pgAdmin и DBeaver сохраняют CSV) ----------
+    site.calls.clear()
+    site.found = {A: 1}
+    page = open_helper(ctx, site, {"width": 1366, "height": 768})
+    adw = ("IIN_BIN;FIO_CLIENT;CONTRACT;PRODUCT\r\n" f"{A};Тестов Тест;007-0001;Кредитная карта\r\n"
+           f'{B};"Иванова; Анна";007-0002;Кредит\r\n').encode("cp1251")
+    opfs_put(page, "ADW 20.11.2026.csv", adw, "csv")
+    use_folder(page, "csv")
+    tree = opfs_tree(page, "csv")
+    expect("CSV: рядом собрана книга .xlsx, работа идёт в ней", "ADW 20.11.2026.xlsx" in tree and page.evaluate("() => window.__tazalau.test.state().tasks") == 2,
+           sorted(tree))
+    final = run_and_wait(page)
+    tree = opfs_tree(page, "csv")
+    ws = load_workbook(io.BytesIO(tree["ADW 20.11.2026.xlsx"]))["Лист1"]
+    heads = [ws.cell(1, c).value for c in range(1, 9)]
+    expect("CSV: столбцы выгрузки на месте (заголовки IIN_BIN и FIO_CLIENT узнаны), результаты добавлены", heads == ["IIN_BIN", "FIO_CLIENT", "CONTRACT", "PRODUCT",
+           "tazalau_file_location", "tazalau_result", "tazalau_status", "tazalau_details"], heads)
+    expect("CSV: кодировка 1251, кавычки и разделитель «;» прочитаны; ИИН и номера договоров остались текстом",
+           (ws["A2"].value, ws["B3"].value, ws["C2"].value, ws["D2"].value) == (A, "Иванова; Анна", "007-0001", "Кредитная карта"), [c.value for c in ws[2]])
+    expect("CSV: папки по ФИО из выгрузки", "Тестов Тест/снимок.png" in tree and "Иванова; Анна/снимок.png" in tree, sorted(n for n in tree if n.endswith(".png")))
+    expect("CSV: сам файл выгрузки не тронут", tree["ADW 20.11.2026.csv"] == adw)
+    worked = tree["ADW 20.11.2026.xlsx"]
+    use_folder(page, "csv")
+    expect("CSV: повторное открытие продолжает ту же книгу", opfs_tree(page, "csv")["ADW 20.11.2026.xlsx"] == worked
+           and "уже со ссылкой 2" in page.inner_text("body"))
+    page.wait_for_timeout(1200)
+    opfs_put(page, "ADW 20.11.2026.csv", ("IIN_BIN;FIO_CLIENT\r\n" f"{C};Новый Клиент\r\n").encode("utf-8"), "csv")
+    use_folder(page, "csv")
+    tree = opfs_tree(page, "csv")
+    backups = [n for n in tree if n.startswith("tazalau_backup/ADW 20.11.2026__")]
+    ws = load_workbook(io.BytesIO(tree["ADW 20.11.2026.xlsx"]))["Лист1"]
+    expect("CSV: новая выгрузка за день: книга собрана заново, прежняя сохранена в tazalau_backup",
+           len(backups) == 1 and tree[backups[0]] == worked and ws["A2"].value == C and ws.max_row == 2 and ws["C1"].value is None, (backups, ws["A2"].value))
+    page.get_by_text("или один файл").click()
+    page.set_input_files("input[type=file]", files=[{"name": "выгрузка.csv", "mimeType": "text/csv", "buffer": adw}])
+    page.wait_for_function("() => window.__tazalau.test.state().tasks === 2")
+    expect("CSV: и в режиме «один файл»", "выгрузка.xlsx" in page.inner_text("body"))
+    expect("CSV: страница без ошибок", not page.errors, page.errors[:3])
+    page.close()
+
+    # ---------- 3е. шаг 1: списки ДГД по регионам ----------
+    today = datetime.date.today()
+    d0, d1, old = (today.strftime("%d.%m.%Y"), (today - datetime.timedelta(days=1)).strftime("%d.%m.%Y"),
+                   (today - datetime.timedelta(days=50)).strftime("%d.%m.%Y"))
+    P1, P2, P3 = plausible("8501013"), plausible("9203154"), plausible("7712305")        # Павлодар (PDF)
+    C1, C2, C3 = plausible("0101015"), plausible("8807074"), plausible("6605053")        # Алматы (Excel; C1 с ведущим нулём)
+    D1, D2, D3 = plausible("9902023"), plausible("8303034"), plausible("7404045")        # Шымкент (CSV в 1251)
+    E1, F1, G1, H1, M1 = plausible("9105064"), plausible("8206073"), plausible("7307084"), plausible("9408093"), plausible("8009103")
+    K1, K2, K3 = plausible("8610113"), plausible("9711124"), plausible("6812013")        # Костанай (PDF через Ghostscript)
+    site.calls.clear()
+    site.found = {}
+    page = open_helper(ctx, site, {"width": 1366, "height": 768})
+
+    def order_pdf(region, rows):
+        maker = ctx.new_page()
+        maker.set_content("<html><head><meta charset='utf-8'><style>body{font-family:Arial} td{border:1px solid #000;padding:4px}</style></head><body>"
+                          f"<h3>Департамент государственных доходов по {region}</h3><p>Приказы о назначении финансового управляющего, {d0}</p>"
+                          "<table><tr><td>№</td><td>ФИО должника</td><td>ИИН должника</td><td>Дата приказа</td><td>Финансовый управляющий</td></tr>" +
+                          "".join(f"<tr><td>{n}</td><td>{fio}</td><td>{iin}</td><td>{date}</td><td>Петров Пётр Петрович</td></tr>" for n, (fio, iin, date) in enumerate(rows, 1)) +
+                          "</table></body></html>")
+        data = maker.pdf()
+        maker.close()
+        return data
+
+    put = lambda name, data: opfs_put(page, name.split("/")[-1], data, "dgd/" + "/".join(name.split("/")[:-1]) if "/" in name else "dgd")
+    put(f"ДГД/Павлодарская {d0}.pdf", order_pdf("Павлодарской области", [("Иванов Иван Иванович", P1, d1), ("Сидорова Анна", P2, d0), ("Ахметов Нурлан", P3, d0)]))
+    wb = Workbook()
+    sh = wb.active
+    sh.append(["Департамент государственных доходов по городу Алматы"])
+    sh.append(["№", "ФИО должника", "ИИН должника", "Дата приказа", "ФИО финансового управляющего", "ИИН финансового управляющего"])
+    for n, (fio, iin) in enumerate([("Нулев Ноль", int(C1)), ("Второв Второй", C2), ("Третьев Третий", int(C3))], 1):
+        sh.append([n, fio, iin, today, "Петров Пётр Петрович", M1])
+        sh.cell(sh.max_row, 4).number_format = "DD.MM.YYYY"
+    buf = io.BytesIO(); wb.save(buf)
+    put(f"ДГД/г. Алматы {d0}.xlsx", buf.getvalue())
+    put(f"ДГД/~$г. Алматы {d0}.xlsx", b"lock")
+    put(f"ДГД/Шымкент/список {d1}.csv", ("ИИН;ФИО;Дата приказа\r\n" + "".join(f"{i};{n};{d1}\r\n" for i, n in
+        [(D1, "Шымкентов Ш."), (D2, "Второва В."), (D3, "Третьякова Т."), (D1[:11] + str((int(D1[11]) + 1) % 10), "Опечаткин О.")])).encode("cp1251"))
+    doc = docx.Document()
+    doc.add_paragraph("Департамент государственных доходов по области Абай")
+    table = doc.add_table(rows=2, cols=4)
+    for cell, text in zip(table.rows[0].cells + table.rows[1].cells, ["№", "ФИО должника", "ИИН", "Дата приказа", "1", "Абаев Абай", E1, d0]):
+        cell.text = text
+    buf = io.BytesIO(); doc.save(buf)
+    put(f"ДГД/Абай {d0}.docx", buf.getvalue())
+    put("ДГД/Улытау.html", ("<html><head><meta charset='utf-8'></head><body><h3>ДГД по области Ұлытау</h3><table><tr><th>ФИО</th><th>ИИН</th><th>Дата</th></tr>"
+                            f"<tr><td>Улытаев Улан</td><td>{F1}</td><td>{old}</td></tr></table></body></html>").encode("utf-8"))
+    png = io.BytesIO(); Image.new("RGB", (40, 30), "white").save(png, "PNG")
+    put(f"ДГД/Жетысу {d0}.png", png.getvalue())
+    plain = PdfReader(io.BytesIO(order_pdf("Атырауской области", [("Закрытов З.", G1, d0)])))
+    locked = PdfWriter(clone_from=plain)
+    locked.encrypt(user_password="", owner_password="secret")
+    buf = io.BytesIO(); locked.write(buf)
+    put(f"ДГД/Атырау {d0}.pdf", buf.getvalue())
+    wb = Workbook(); wb.active.append(["ФИО", "ИИН"]); wb.active.append(["Безрегионов Б.", G1]); buf = io.BytesIO(); wb.save(buf)
+    put(f"ДГД/прочее/список {d0}.xlsx", buf.getvalue())
+    gs = shutil.which("gs")
+    if gs:
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "in.pdf", Path(tmp) / "out.pdf"
+            src.write_bytes(order_pdf("Костанайской области", [("Костанаев К.", K1, d0), ("Второв К.", K2, d0), ("Третьев К.", K3, d0)]))
+            subprocess.run([gs, "-q", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.7", "-o", str(dst), str(src)], check=True)
+            expect("ДГД: проверка осмысленна: Ghostscript упаковал объекты PDF в потоки", b"/ObjStm" in dst.read_bytes())
+            put(f"ДГД/Костанай {d0}.pdf", dst.read_bytes())
+    work = fio_book("FIO", [("Нигде Ни", H1), ("Павлодаров П.", P1), ("Нулев Ноль", C1), ("Шымкентов Ш.", D1)])
+    opfs_put(page, "работа.xlsx", work, "dgd")
+    use_folder(page, "dgd")
+    page.wait_for_function("() => { const d = window.__tazalau.test.state().dgd; return d && d !== 'reading'; }", timeout=30000)
+    state = page.evaluate("() => window.__tazalau.test.state().dgd")
+    regions = {r["name"]: r for r in state["regions"]}
+    expect("ДГД: в проверке все 20 регионов и отдельная строка для файлов без региона", len(regions) == 21 and "Регион не определён" in regions, sorted(regions))
+    want = {"Павлодарская обл.": ("good", "в порядке", 3), "г. Алматы": ("good", "в порядке", 3), "г. Шымкент": ("warn", "неверных ИИН: 1", 3),
+            "Абайская обл.": ("warn", "всего 1 ИИН: проверить вручную", 1), "Жетысуская обл.": ("bad", "0 ИИН: это картинка (скан)", 0),
+            "Атырауская обл.": ("bad", "файл не прочитан", 0), "Акмолинская обл.": ("bad", "нет списка", 0),
+            "Регион не определён": ("warn", "укажите регион в имени файла", 1)}
+    if gs:
+        want["Костанайская обл."] = ("good", "в порядке", 3)
+    for name, (level, text, unique) in want.items():
+        r = regions[name]
+        expect(f"ДГД: {name}: {text}", r["level"] == level and text in r["text"] and r["unique"] == unique, r)
+    ul = regions["Улытауская обл."]
+    expect("ДГД: старый список отмечен (самая свежая дата 50 дней назад) и мало ИИН", ul["level"] == "warn" and "всего 1 ИИН" in ul["text"]
+           and f"самая свежая дата {old}: 50 дн. назад" in ul["text"], ul)
+    expect("ДГД: ИИН управляющего не считается ИИН должника, файл-замок Excel пропущен", state["iins"] == 3 + 3 + 3 + 1 + 1 + 1 + (3 if gs else 0)
+           and state["files"] == 8 + (1 if gs else 0), state)
+    panel = page.inner_text("#tazalau-dgd")
+    expect("ДГД: окно показывает проверку регионов", "ДГД: регионов со списком" in panel and "⚠ проверить:" in panel, panel[:300])
+    expect("ДГД: окно сообщает, сколько ИИН файла есть в списках ДГД", "Из них в списках ДГД: 3 (проверяются первыми)" in page.inner_text("body"))
+    final = run_and_wait(page)
+    tree = opfs_tree(page, "dgd")
+    expect("ДГД: ИИН из списков ДГД проверены первыми", [c[1] for c in site.calls] == [P1, C1, D1, H1], [c[1] for c in site.calls])
+    ws = check_xlsx("ДГД работа", work, tree["работа.xlsx"])["ИИН"]
+    heads = [ws.cell(1, c).value for c in range(1, 8)]
+    expect("ДГД: столбец «ДГД» добавлен в рабочий файл", heads == ["FIO", "ИИН/БИН", "tazalau_file_location", "tazalau_result", "tazalau_status", "tazalau_details", "ДГД"], heads)
+    expect("ДГД: регион, дата списка, дата строки, управляющий; ссылка на файл ДГД",
+           ws["G3"].value == f"Павлодарская обл., список от {d0}, дата {d1}" and urllib.parse.unquote(ws["G3"].hyperlink.target) == f"ДГД/Павлодарская {d0}.pdf"
+           and ws["G4"].value == f"г. Алматы, список от {d0}, дата {d0}, управляющий: Петров Пётр Петрович"
+           and ws["G5"].value == f"г. Шымкент, список от {d1}, дата {d1}" and ws["G2"].value in (None, ""),
+           [ws.cell(r, 7).value for r in range(2, 6)])
+    summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
+    reg, iins, files = summary["Регионы"], summary["ИИН"], summary["Файлы"]
+    rows = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 10)] for r in range(2, reg.max_row + 1)}
+    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом", summary.sheetnames == ["Регионы", "ИИН", "Файлы"] and len(rows) == 21
+           and rows["Акмолинская обл."][1] == "нет списка" and reg.cell(list(rows).index("Акмолинская обл.") + 2, 2).fill.fgColor.rgb.endswith("FFC7CE")
+           and rows["Павлодарская обл."][1] == "в порядке" and reg.cell(list(rows).index("Павлодарская обл.") + 2, 2).fill.fgColor.rgb.endswith("C6EFCE")
+           and rows["Павлодарская обл."][6] == d0, rows.get("Павлодарская обл."))
+    got = {iins.cell(r, 1).value: [iins.cell(r, c).value for c in range(1, 9)] for r in range(2, iins.max_row + 1)}
+    expect("ДГД свод: лист «ИИН»: ИИН текстом (ведущий ноль цел), ФИО, регион, управляющий, файл со ссылкой",
+           got[C1][:5] == [C1, "Нулев Ноль", "г. Алматы", d0, "Петров Пётр Петрович"] and got[P1][1] == "Иванов Иван Иванович"
+           and iins.cell(list(got).index(P1) + 2, 7).hyperlink is not None and M1 not in got, got.get(C1))
+    notes = {files.cell(r, 1).value: files.cell(r, 8).value for r in range(2, files.max_row + 1)}
+    expect("ДГД свод: лист «Файлы»: причины по нечитаемым файлам", "PDF защищён" in str(notes.get(f"ДГД/Атырау {d0}.pdf"))
+           and "картинка (скан)" in str(notes.get(f"ДГД/Жетысу {d0}.png")) and "контрольная цифра" in str(notes.get(f"ДГД/Шымкент/список {d1}.csv")), notes)
+    page.get_by_role("button", name="ИИН для SQL ⧉").click()
+    page.wait_for_function("() => /Скопировано ИИН:/.test(document.querySelector('#tazalau-state').textContent)")
+    expect("ДГД: «ИИН для SQL» копирует все ИИН списков", f"Скопировано ИИН: {state['iins']}." in page.evaluate(STATE), page.evaluate(STATE))
+    options = page.evaluate("() => Array.from(document.querySelectorAll('select option')).map(o => o.value)")
+    expect("ДГД: свод не предлагается как рабочий файл", "ДГД_свод.xlsx" not in options, options)
+    expect("ДГД: страница без ошибок", not page.errors, page.errors[:3])
+    for name, data in [("Павлодарская.pdf", order_pdf("Павлодарской области", [("Один О.", P1, d0)]))]:
+        opfs_put(page, name, data, "dgdonly/ДГД")
+    page.evaluate("""async () => { const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('dgdonly');
+        await window.__tazalau.test.useDir(dir); }""")
+    page.wait_for_function("() => { const d = window.__tazalau.test.state().dgd; return d && d !== 'reading'; }", timeout=30000)
+    expect("ДГД без рабочего файла: помощник объясняет", "нет файла с ИИН" in page.evaluate(STATE))
+    page.get_by_role("button", name="Свод ДГД ↓").click()
+    page.wait_for_function("() => /Свод ДГД записан/.test(document.querySelector('#tazalau-state').textContent)")
+    expect("ДГД без рабочего файла: свод пишется кнопкой", "ДГД_свод.xlsx" in opfs_tree(page, "dgdonly"))
+    page.close()
+
+    # ---------- 3ж. чтение PDF: простые шрифты, скан, защита ----------
+    page = open_helper(ctx, site, {"width": 1366, "height": 768})
+    buf = io.BytesIO()
+    canvas = rl_canvas.Canvas(buf)
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 760, f"IIN {P1}  date {d0}")
+    canvas.drawString(72, 740, f"IIN {P2[:4]} {P2[4:8]} {P2[8:]}")
+    canvas.save()
+    simple = buf.getvalue()
+    buf = io.BytesIO()
+    canvas = rl_canvas.Canvas(buf)
+    canvas.drawImage(ImageReader(Image.new("RGB", (200, 80), "gray")), 72, 600, width=200, height=80)
+    canvas.save()
+    scanned = buf.getvalue()
+    probe = page.evaluate("""async ([a, b]) => { const t = window.__tazalau.test, u = x => Uint8Array.from(atob(x), c => c.charCodeAt(0));
+        const r1 = await t.fileRows('простой.pdf', u(a)), r2 = await t.fileRows('скан.pdf', u(b));
+        return { simple: t.extractIins(r1.rows).items.map(x => x.iin), note: r2.note }; }""", [base64.b64encode(simple).decode(), base64.b64encode(scanned).decode()])
+    expect("PDF: простой шрифт без таблицы символов и ИИН группами по 4 цифры", probe["simple"] == [P1, P2], probe)
+    expect("PDF: скан без текста распознан как скан", "скан" in probe["note"], probe)
+    page.close()
 
     # ---------- 4. несколько реестров: один снимок на ИИН ----------
     site.calls.clear()
