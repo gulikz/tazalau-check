@@ -646,10 +646,35 @@ def _build_contr(W) -> pd.DataFrame:
     return df[CONTR_COLS]
 
 
+def _partial_payments(E, rep, m, at, dpd, share=0.06):
+    """Re-ageing: in a share of long episodes the client pays ONE instalment on day p while staying overdue, so the
+    DPD drops by 30 and the implied start moves forward one month. Monthly max rows change accordingly (the month
+    of the payment keeps the larger of the pre-payment and the post-payment maximum)."""
+    rng = np.random.default_rng(7919 * len(E["start"]) + int(E["start"].sum() % 100_003))
+    n = len(E["start"])
+    long_ep = (E["last"] - E["start"]) >= 45
+    pick = long_ep & (rng.random(n) < share)
+    p = E["start"] + rng.integers(31, 45, n)                  # payment day: DPD 31..44 before the payment
+    pick &= p < E["last"]
+    sel = pick[rep]
+    pp = p[rep]
+    st = E["start"][rep]
+    at, dpd = at.copy(), dpd.copy()
+    after = sel & (_month_start(m) > pp)                       # months fully after the payment
+    dpd[after] -= 30
+    cur = sel & (_month_start(m) <= pp) & (at > pp)            # the month of the payment
+    pre, post = pp - st + 1, dpd - 30
+    keep_pre = cur & (pre >= post)
+    at = np.where(keep_pre, pp, at)
+    dpd = np.where(keep_pre, pre, np.where(cur, post, dpd))
+    return at, dpd
+
+
 def _build_ovrd(W) -> pd.DataFrame:
     rng = W.rng["ovrd"]
     E = W.E
     rep, m, at, dpd = _expand_months(E["start"], E["last"])
+    at, dpd = _partial_payments(E, rep, m, at, dpd)
     c = E["c"][rep]
     d = pd.DataFrame({"c": c, "m": m, "at": at, "dpd": dpd})
     d = d.sort_values(["c", "m", "dpd"]).drop_duplicates(["c", "m"], keep="last")   # one row per contract-month

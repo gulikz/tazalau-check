@@ -25,3 +25,5 @@ __pycache__/
 
 # Результаты прогонов ноутбука сегментации (содержат ИИН)
 credit_segments/out/
+credit_segments/out_demo/
+credit_segments/data/
