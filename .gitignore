@@ -22,3 +22,6 @@ dist/
 __pycache__/
 .pytest_cache/
 .DS_Store
+
+# Результаты прогонов ноутбука сегментации (содержат ИИН)
+credit_segments/out/
