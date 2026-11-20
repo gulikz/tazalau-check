@@ -27,3 +27,6 @@ __pycache__/
 credit_segments/out/
 credit_segments/out_demo/
 credit_segments/data/
+
+# синтетический пример выгрузки ADW (вымышленные люди, ИИН с невозможным 13-м месяцем)
+!sql/ADW_пример_выгрузки.csv

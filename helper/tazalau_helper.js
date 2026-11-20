@@ -1,4 +1,4 @@
-/* Tazalau помощник: версия 4.
+/* Tazalau помощник: версия 5.
    Закладка для tazalau.qoldau.kz (Edge или Chrome). Ничего не устанавливает. Ежедневная проверка в три шага:
    1) списки ДГД (финансовые управляющие) из подпапки «ДГД»: ИИН, регион, дата, проверка каждого региона, свод;
    2) рабочий файл: выгрузка ADW (xlsx или csv) с проблемными кредитами и картами, столбец с ИИН;
@@ -10,8 +10,9 @@
    Вход на сайт и ЭЦП не нужны. Файл Excel читается и изменяется только внутри браузера и никуда не отправляется. */
 (() => {
   'use strict';
-  const VERSION = '4';
+  const VERSION = '5';
   if (window.__tazalau) { window.__tazalau.show(); return; }
+  if (/(^|\.)kgd\.gov\.kz$/i.test(location.hostname)) { relay(); return; }
   if (!/(^|\.)tazalau\.qoldau\.kz$/i.test(location.hostname)) {
     const check = document.getElementById('tazalau-check');
     if (check) {                    /* закладку нажали на странице установки: это проверка */
@@ -23,6 +24,48 @@
     if (confirm('Помощник работает только на сайте tazalau.qoldau.kz.\n\nОткрыть сайт сейчас? ' +
                 'Потом нажмите закладку Tazalau ещё раз.')) location.href = 'https://tazalau.qoldau.kz/ru/list/bankruptcy/recovery';
     return;
+  }
+
+  /* На сайте ДГД (*.kgd.gov.kz) закладка работает связным. Браузер разрешает скачивать страницы и файлы сайта только
+     самому этому сайту, поэтому помощник из вкладки tazalau открывает сайт региона в отдельном окне, а закладка в этом
+     окне по его просьбе скачивает нужные адреса этого же сайта и передаёт их обратно. Чужие адреса не скачиваются,
+     просьбы принимаются только от окна tazalau.qoldau.kz, которое открыло это окно. Всё остальное делает помощник. */
+  function relay() {
+    const HOME = 'https://tazalau.qoldau.kz';
+    if (window.__tazalauRelay) { window.__tazalauRelay(); return; }
+    if (!document.body) { document.addEventListener('DOMContentLoaded', relay, { once: true }); return; }   /* страница ещё грузится */
+    const box = document.createElement('div');
+    box.style.cssText = 'position:fixed;top:10px;right:10px;z-index:2147483647;max-width:400px;padding:10px 12px;border-radius:8px;' +
+      'background:#fff8e1;border:2px solid #e3b341;font:14px/1.45 Arial,sans-serif;color:#1d2433;box-shadow:0 2px 12px rgba(0,0,0,.25);white-space:pre-line;text-align:left';
+    const say = t => { box.textContent = 'Tazalau ▶ ДГД (версия ' + VERSION + ')\n' + t; };
+    document.body.appendChild(box);
+    window.__tazalauRelay = () => { if (!box.isConnected) document.body.appendChild(box); };
+    let opener = null;
+    try { opener = window.opener; } catch (e) { opener = null; }
+    if (!opener) {
+      say('Это окно открыл не помощник. Откройте tazalau.qoldau.kz, нажмите закладку Tazalau и кнопку «Собрать ДГД с сайтов»: ' +
+        'помощник сам откроет сайты ДГД по очереди в новой вкладке, а там останется только нажимать закладку.');
+      return;
+    }
+    window.addEventListener('message', async e => {
+      const m = e.data;
+      if (e.origin !== HOME || e.source !== opener || !m || typeof m.tz !== 'string') return;
+      if (m.tz === 'say') { say(String(m.text || '')); return; }
+      if (m.tz !== 'fetch') return;
+      try {
+        const u = new URL(String(m.url), location.href);
+        if (u.origin !== location.origin) throw new Error('адрес другого сайта: ' + u.origin);
+        const head = m.method === 'HEAD';
+        const r = await fetch(u.href, { method: head ? 'HEAD' : 'GET', credentials: 'same-origin', cache: 'no-cache', redirect: 'follow' });
+        const buf = head ? new ArrayBuffer(0) : await r.arrayBuffer();
+        opener.postMessage({ tz: 'fetched', id: m.id, ok: r.ok, status: r.status, type: r.headers.get('content-type') || '',
+          modified: r.headers.get('last-modified') || '', url: r.url, bytes: buf }, HOME, [buf]);
+      } catch (err) {
+        opener.postMessage({ tz: 'fetched', id: m.id, ok: false, status: 0, error: String((err && err.message) || err) }, HOME);
+      }
+    });
+    opener.postMessage({ tz: 'hello', href: location.href, host: location.host, html: document.documentElement.outerHTML, version: VERSION }, HOME);
+    say('Связь с помощником есть: скачиваю приказы этого сайта. Вкладка сама перейдёт к следующему региону, там снова нажмите закладку Tazalau.');
   }
 
   /* ======================= НАСТРОЙКИ ======================= */
@@ -810,7 +853,8 @@
     }
     return { s, end: j };
   }
-  async function pdfLines(bytes) {
+  /* Объекты PDF-файла: словари, потоки (с распаковкой), страницы по порядку. Общая часть для текста и сканов. */
+  async function pdfOpen(bytes) {
     const raw = latin1(bytes);
     if (!/^%PDF-/.test(raw.slice(0, 1024).trimStart())) throw new Error('это не PDF');
     if (/\/Encrypt\s*\d+\s+\d+\s+R|\/Encrypt\s*<</.test(raw)) throw new Error('PDF защищён от копирования текста: сохраните его заново без защиты или как Excel');
@@ -822,10 +866,10 @@
       let end = raw.indexOf('endobj', start);
       if (end < 0) end = raw.length;
       let body = raw.slice(start, end), data = null;
-      const si = body.search(/stream\r?\n/);
+      const si = body.search(/stream(?:\r\n|\r|\n)/);           /* после stream: CRLF, LF или (так пишет HP Scan) один CR */
       if (si >= 0 && body.slice(0, si).includes('<<')) {
         const dict = pdfParse(body.slice(0, si));
-        const off = start + si + /^stream\r?\n/.exec(body.slice(si))[0].length;
+        const off = start + si + /^stream(?:\r\n|\r|\n)/.exec(body.slice(si))[0].length;
         let len = dict && typeof dict.Length === 'number' ? dict.Length : -1;
         let stop = len >= 0 && raw.slice(off + len, off + len + 30).replace(/^\s+/, '').startsWith('endstream') ? off + len : raw.indexOf('endstream', off);
         if (stop < 0) stop = end;
@@ -838,17 +882,42 @@
     }
     const get = o => (o && o.ref != null ? (objs.has(o.ref) ? dictOf(objs.get(o.ref)) : null) : o);
     function dictOf(o) { if (o.dict === null) o.dict = pdfParse(o.body); return o.dict; }
-    async function streamOf(o) {
-      if (!o || !o.data) return new Uint8Array(0);
+    /* image: для картинок вернуть { data, filter, parms }: данные до последнего фильтра (JPEG, факс), который
+       распаковывается отдельно; для остальных потоков: распакованные данные (картинки и редкие сжатия: пусто) */
+    async function streamOf(o, image) {
+      if (!o || !o.data) return image ? null : new Uint8Array(0);
       const d = dictOf(o) || {};
       let data = o.data;
-      for (const f of [].concat(get(d.Filter) || []).map(x => x && x.name)) {        /* цепочка фильтров по порядку */
-        if (f === 'FlateDecode' || f === 'Fl') data = await pump(stream('in', 'deflate'), data, true);
+      const filters = [].concat(get(d.Filter) || []).map(x => x && x.name);
+      const parms = [].concat(get(d.DecodeParms) || get(d.DP) || []).map(x => get(x) || null);
+      for (let k = 0; k < filters.length; k++) {                                    /* цепочка фильтров по порядку */
+        const f = filters[k];
+        if (f === 'FlateDecode' || f === 'Fl') {
+          data = await pump(stream('in', 'deflate'), data, true);
+          if (image && parms[k] && parms[k].Predictor >= 10) data = pngUnpredict(data, parms[k]);
+        }
         else if (f === 'ASCII85Decode' || f === 'A85') data = ascii85(data);
         else if (f === 'ASCIIHexDecode' || f === 'AHx') { const hx = latin1(data).replace(/>.*$/s, '').replace(/[^0-9a-f]/gi, ''); data = Uint8Array.from(hx.match(/.{1,2}/g) || [], x => parseInt((x + '0').slice(0, 2), 16)); }
+        else if (image) return { data, filter: f, parms: parms[k] || {} };
         else return new Uint8Array(0);           /* картинки и редкие способы сжатия: текста в них нет */
       }
-      return data;
+      return image ? { data, filter: '', parms: {} } : data;
+    }
+    function pngUnpredict(u8, p) {             /* PNG-предсказатели строк (Predictor 10–15) */
+      const colors = p.Colors || 1, bpc = p.BitsPerComponent || 8, cols = p.Columns || 1;
+      const bpp = Math.max(1, Math.ceil(colors * bpc / 8)), rowLen = Math.ceil(colors * bpc * cols / 8);
+      const rows = Math.floor(u8.length / (rowLen + 1)), out = new Uint8Array(rows * rowLen);
+      for (let r = 0; r < rows; r++) {
+        const t = u8[r * (rowLen + 1)], src = r * (rowLen + 1) + 1, dst = r * rowLen, up = dst - rowLen;
+        for (let i = 0; i < rowLen; i++) {
+          const a = i >= bpp ? out[dst + i - bpp] : 0, b = r ? out[up + i] : 0, c = r && i >= bpp ? out[up + i - bpp] : 0, x = u8[src + i];
+          let v = x;
+          if (t === 1) v = x + a; else if (t === 2) v = x + b; else if (t === 3) v = x + ((a + b) >> 1);
+          else if (t === 4) { const pp = a + b - c, pa = Math.abs(pp - a), pb = Math.abs(pp - b), pc = Math.abs(pp - c); v = x + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c); }
+          out[dst + i] = v & 255;
+        }
+      }
+      return out;
     }
     function ascii85(u8) {
       const t = latin1(u8).replace(/^\s*<~/, '').replace(/~>.*$/s, '').replace(/\s+/g, '');
@@ -873,6 +942,19 @@
         if (!objs.has(String(head[k]))) objs.set(String(head[k]), { body: text.slice(from, to), data: null, dict: null });
       }
     }
+    const pages = [];
+    const seenPages = new Set();
+    const walk = node => {                      /* порядок страниц: дерево /Pages */
+      if (!node || pages.length > 5000) return;
+      if (node.Type && node.Type.name === 'Page') { if (!seenPages.has(node)) { seenPages.add(node); pages.push(node); } return; }
+      for (const k of [].concat(get(node.Kids) || [])) walk(get(k));
+    };
+    for (const o of objs.values()) { const d = dictOf(o); if (d && d.Type && d.Type.name === 'Catalog') walk(get(d.Pages)); }
+    if (!pages.length) for (const o of objs.values()) { const d = dictOf(o); if (d && d.Type && d.Type.name === 'Page') pages.push(d); }
+    return { objs, get, dictOf, streamOf, pages };
+  }
+  async function pdfLines(bytes) {
+    const { objs, get, streamOf, pages } = await pdfOpen(bytes);
     const cmaps = new Map();
     async function fontMap(font) {
       if (!font) return null;
@@ -914,15 +996,6 @@
       }
       return res;
     }
-    const pages = [];
-    const seenPages = new Set();
-    const walk = node => {                      /* порядок страниц: дерево /Pages */
-      if (!node || pages.length > 5000) return;
-      if (node.Type && node.Type.name === 'Page') { if (!seenPages.has(node)) { seenPages.add(node); pages.push(node); } return; }
-      for (const k of [].concat(get(node.Kids) || [])) walk(get(k));
-    };
-    for (const o of objs.values()) { const d = dictOf(o); if (d && d.Type && d.Type.name === 'Catalog') walk(get(d.Pages)); }
-    if (!pages.length) for (const o of objs.values()) { const d = dictOf(o); if (d && d.Type && d.Type.name === 'Page') pages.push(d); }
     const lines = [];
     for (const pg of pages) {
       let resources = get(pg.Resources), up = get(pg.Parent);
@@ -1002,6 +1075,499 @@
     return lines;
   }
 
+  /* ====================== ИИН на сканах: распознавание цифр без библиотек ====================== */
+  /* Приказы ДГД публикуются сканами (PDF с картинкой страницы или JPEG). Если у PDF есть текстовый слой (его добавляют
+     сканер или ABBYY), ИИН берётся из текста. Иначе помощник читает цифры с картинки сам: страница становится
+     чёрно-белой, находятся отдельные знаки, из них цепочки знаков одной высоты с ровным шагом (так выглядит число),
+     каждый знак сравнивается с образцами цифр. ИИН засчитывается, только если сходится контрольная цифра и дата
+     рождения настоящая; если цифру пришлось подобрать по контрольной цифре, ИИН помечается «проверить». */
+  const OCR_DPI = 200;                     /* страница перед распознаванием: точек на дюйм */
+  const OCR_PAGES = 3;                     /* ИИН ищется на первых страницах приказа */
+  const OCR_GW = 12, OCR_GH = 18;          /* сетка, по которой знак сравнивается с образцом цифры */
+  const OCR_SIZES = [16, 22, 30, 40];      /* высоты образцов цифр, точек */
+  function canvasOf(w, h) {
+    if (typeof OffscreenCanvas === 'function') return new OffscreenCanvas(w, h);
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    return c;
+  }
+  const ctx2d = c => c.getContext('2d', { willReadFrequently: true });
+  const mulM = (a, b) => [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3], a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+    a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5]];
+
+  /* Картинка PDF (XObject /Image) как холст или ImageBitmap */
+  async function pdfImage(doc, o) {
+    const d = doc.dictOf(o) || {};
+    const w = d.Width | 0, h = d.Height | 0;
+    if (!w || !h || w * h > 80e6) return null;
+    const s = await doc.streamOf(o, true);
+    if (!s) return null;
+    if (s.filter === 'DCTDecode' || s.filter === 'DCT') return createImageBitmap(new Blob([s.data], { type: 'image/jpeg' }));
+    if (s.filter) throw new Error(s.filter === 'JPXDecode' ? 'скан в формате JPEG 2000 (браузер его не открывает)' : 'скан в формате ' + s.filter.replace(/Decode$/, ''));
+    const mask = d.ImageMask === true;
+    const bpc = mask ? 1 : (d.BitsPerComponent | 0) || 8;
+    const cs = doc.get(d.ColorSpace);
+    const csName = x => (x && x.name) || (Array.isArray(x) && x[0] && x[0].name) || '';
+    const comps = x => { const nm = csName(x); if (/RGB|^Lab$/.test(nm)) return 3; if (/CMYK/.test(nm)) return 4; if (nm === 'ICCBased') { const st = doc.get(x[1]); return (st && st.N) || 3; } return 1; };
+    let n = mask ? 1 : comps(cs), lut = null, lutN = 0;
+    if (!mask && csName(cs) === 'Indexed') {
+      lutN = comps(doc.get(cs[1]));
+      const L = cs[3], lo = L && L.ref != null ? doc.objs.get(L.ref) : null;
+      if (lo && lo.data) lut = await doc.streamOf(lo);
+      else { const v = doc.get(L); if (v && v.str != null) lut = Uint8Array.from(v.str, ch => ch.charCodeAt(0)); }
+      if (!lut) return null;
+      n = 1;
+    }
+    const dec = doc.get(d.Decode), inv = Array.isArray(dec) && dec[0] === 1;
+    const data = s.data, rowBytes = Math.ceil(w * n * bpc / 8), max = (1 << Math.min(bpc, 8)) - 1;
+    if (data.length < rowBytes * h) return null;
+    const img = new ImageData(w, h), px = img.data;
+    const at = (y, i) => {                   /* i-й отсчёт строки y: целое 0..max */
+      if (bpc === 8) return data[y * rowBytes + i];
+      if (bpc === 16) return data[y * rowBytes + 2 * i];
+      const bit = i * bpc;
+      return (data[y * rowBytes + (bit >> 3)] >> (8 - bpc - (bit & 7))) & max;
+    };
+    const k8 = v => (bpc >= 8 ? v : Math.round(v * 255 / max));
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const p = (y * w + x) * 4;
+        let r, g, b, a = 255;
+        if (mask) { r = g = b = 0; if (at(y, x) !== (inv ? 1 : 0)) a = 0; }       /* трафарет: закрашено только отмеченное */
+        else if (lut) {
+          const v = at(y, x) * lutN;
+          if (lutN === 1) r = g = b = lut[v];
+          else if (lutN === 4) { const kk = lut[v + 3]; r = 255 - Math.min(255, lut[v] + kk); g = 255 - Math.min(255, lut[v + 1] + kk); b = 255 - Math.min(255, lut[v + 2] + kk); }
+          else { r = lut[v]; g = lut[v + 1]; b = lut[v + 2]; }
+        } else if (n === 1) { const v = k8(at(y, x)); r = g = b = inv ? 255 - v : v; }
+        else if (n === 4) {
+          const kk = k8(at(y, 4 * x + 3));
+          r = 255 - Math.min(255, k8(at(y, 4 * x)) + kk); g = 255 - Math.min(255, k8(at(y, 4 * x + 1)) + kk); b = 255 - Math.min(255, k8(at(y, 4 * x + 2)) + kk);
+        } else { r = k8(at(y, n * x)); g = k8(at(y, n * x + 1)); b = k8(at(y, n * x + 2)); }
+        px[p] = r; px[p + 1] = g; px[p + 2] = b; px[p + 3] = a;
+      }
+    }
+    const c = canvasOf(w, h);
+    ctx2d(c).putImageData(img, 0, 0);
+    return c;
+  }
+  function rotated(src, deg) {                 /* поворот по часовой стрелке на 90, 180 или 270 градусов */
+    const w = src.width, h = src.height, swap = deg === 90 || deg === 270;
+    const c = canvasOf(swap ? h : w, swap ? w : h), g = ctx2d(c);
+    g.translate(c.width / 2, c.height / 2);
+    g.rotate(deg * Math.PI / 180);
+    g.drawImage(src, -w / 2, -h / 2);
+    return c;
+  }
+  /* Страница PDF картинкой: все картинки страницы на своих местах (матрицы cm), с поворотом /Rotate.
+     null: картинок на странице нет (обычный текстовый PDF). */
+  async function pdfPageImage(doc, pg, dpi) {
+    const inh = key => { let node = pg; for (let i = 0; node && i < 32; i++) { if (node[key] != null) return doc.get(node[key]); node = doc.get(node.Parent); } return null; };
+    const box = [].concat(inh('CropBox') || inh('MediaBox') || [0, 0, 595, 842]).map(v => +doc.get(v) || 0);
+    const x0 = Math.min(box[0], box[2]), x1 = Math.max(box[0], box[2]), y0 = Math.min(box[1], box[3]), y1 = Math.max(box[1], box[3]);
+    if (x1 - x0 < 10 || y1 - y0 < 10) return null;
+    const draws = [];
+    const scan = async (content, res, ctm, depth) => {
+      const xo = doc.get((res || {}).XObject) || {};
+      const stack = [], n = content.length;
+      let m = ctm, nums = [], name = null, i = 0;
+      while (i < n) {
+        const c = content[i];
+        if (c === ' ' || c === '\n' || c === '\r' || c === '\t' || c === '\0' || c === '\f') { i++; continue; }
+        if (c === '%') { while (i < n && content[i] !== '\n' && content[i] !== '\r') i++; continue; }
+        if (c === '(') { i = pdfString(content, i).end; nums = []; continue; }
+        if (c === '<') { if (content[i + 1] === '<') { i += 2; continue; } const j = content.indexOf('>', i); i = j < 0 ? n : j + 1; continue; }
+        if (c === '>' || c === '[' || c === ']' || c === '{' || c === '}') { i++; continue; }
+        if (c === '/') { let j = i + 1; while (j < n && !/[\s\0/<>\[\]()%{}]/.test(content[j])) j++; name = content.slice(i + 1, j); i = j; continue; }
+        const num = /^[+-]?(?:\d+\.?\d*|\.\d+)/.exec(content.slice(i, i + 32));
+        if (num) { nums.push(+num[0]); i += num[0].length; continue; }
+        let j = i;
+        while (j < n && /[A-Za-z*'"]/.test(content[j])) j++;
+        if (j === i) { i++; continue; }
+        const op = content.slice(i, j);
+        i = j;
+        if (op === 'BI') { const e = content.indexOf('EI', i); i = e < 0 ? n : e + 2; }
+        else if (op === 'q') stack.push(m);
+        else if (op === 'Q') { if (stack.length) m = stack.pop(); }
+        else if (op === 'cm' && nums.length >= 6) m = mulM(nums.slice(-6), m);
+        else if (op === 'Do' && name && xo[name] && xo[name].ref != null) {
+          const o = doc.objs.get(xo[name].ref), d = o ? doc.dictOf(o) : null, sub = d && d.Subtype && d.Subtype.name;
+          if (sub === 'Image') draws.push({ o, m });
+          else if (sub === 'Form' && depth < 4) {
+            const fm = [].concat(doc.get(d.Matrix) || [1, 0, 0, 1, 0, 0]).map(v => +doc.get(v) || 0);
+            await scan(latin1(await doc.streamOf(o)), doc.get(d.Resources) || res, mulM(fm, m), depth + 1);
+          }
+        }
+        nums = [];
+        name = null;
+      }
+    };
+    let cs = pg.Contents;
+    if (cs && cs.ref != null && doc.objs.has(cs.ref) && !doc.objs.get(cs.ref).data) cs = doc.get(cs);
+    const parts = [];
+    for (const c of [].concat(cs || [])) if (c && c.ref != null && doc.objs.has(c.ref)) parts.push(latin1(await doc.streamOf(doc.objs.get(c.ref))));
+    await scan(parts.join('\n'), inh('Resources'), [1, 0, 0, 1, 0, 0], 0);
+    if (!draws.length) return null;
+    let k = dpi / 72;
+    if ((x1 - x0) * (y1 - y0) * k * k > 14e6) k = Math.sqrt(14e6 / ((x1 - x0) * (y1 - y0)));
+    const W = Math.round((x1 - x0) * k), H = Math.round((y1 - y0) * k);
+    const page = canvasOf(W, H), g = ctx2d(page);
+    g.fillStyle = '#fff';
+    g.fillRect(0, 0, W, H);
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    const dev = [k, 0, 0, -k, -x0 * k, y1 * k];
+    let drawn = 0, err = null;
+    for (const dr of draws) {
+      let im;
+      try { im = await pdfImage(doc, dr.o); } catch (e) { err = e; continue; }
+      if (!im) continue;
+      const t = mulM(mulM([1 / im.width, 0, 0, -1 / im.height, 0, 1], dr.m), dev);
+      if (Math.abs(t[0] * im.width) + Math.abs(t[2] * im.height) > 4) {              /* крошечная картинка (значок): пропустить */
+        g.setTransform(t[0], t[1], t[2], t[3], t[4], t[5]);
+        g.drawImage(im, 0, 0);
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        drawn++;
+      }
+      if (im.close) im.close();
+    }
+    if (!drawn) { if (err) throw err; return null; }
+    const rot = ((Math.round(+inh('Rotate') || 0) % 360) + 360) % 360;
+    const out = rot ? rotated(page, rot) : page;
+    if (err) out.partial = (err && err.message) || String(err);           /* часть картинок не прочиталась (например, слой текста CCITT) */
+    return out;
+  }
+  /* Файл-картинка (JPEG, PNG): считается листом A4, приводится к OCR_DPI */
+  async function imageFileCanvas(bytes, mime) {
+    const bm = await createImageBitmap(new Blob([bytes], { type: mime }));
+    const inch = bm.height >= bm.width ? 8.27 : 11.69;
+    let k = OCR_DPI / (bm.width / inch);
+    if (bm.width * bm.height * k * k > 14e6) k = Math.sqrt(14e6 / (bm.width * bm.height));
+    const W = Math.max(1, Math.round(bm.width * k)), H = Math.max(1, Math.round(bm.height * k));
+    const c = canvasOf(W, H), g = ctx2d(c);
+    g.fillStyle = '#fff';
+    g.fillRect(0, 0, W, H);
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(bm, 0, 0, W, H);
+    if (bm.close) bm.close();
+    return c;
+  }
+  function grayOf(c) {
+    const w = c.width, h = c.height, d = ctx2d(c).getImageData(0, 0, w, h).data, g = new Uint8Array(w * h);
+    for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = (d[i] * 77 + d[i + 1] * 151 + d[i + 2] * 28) >> 8;
+    return { w, h, g };
+  }
+  /* Связные пятна чёрных точек (8 соседей) по отрезкам строк: { rY, rA, rB, C: [{ x0, y0, x1, y1, n, runs }] } */
+  function componentsOf(ink, w, h) {
+    const rY = [], rA = [], rB = [], par = [];
+    const find = a => { while (par[a] !== a) { par[a] = par[par[a]]; a = par[a]; } return a; };
+    let prev0 = 0, prev1 = 0;
+    for (let y = 0; y < h; y++) {
+      const cur0 = rY.length, o = y * w;
+      let p = prev0;
+      for (let x = 0; x < w;) {
+        if (!ink[o + x]) { x++; continue; }
+        const a = x;
+        while (x < w && ink[o + x]) x++;
+        const b = x - 1, id = rY.length;
+        rY.push(y); rA.push(a); rB.push(b); par.push(id);
+        while (p < prev1 && rB[p] < a - 1) p++;
+        for (let q = p; q < prev1 && rA[q] <= b + 1; q++) {
+          const ra = find(q), rb = find(id);
+          if (ra !== rb) { if (ra < rb) par[rb] = ra; else par[ra] = rb; }
+        }
+      }
+      prev0 = cur0;
+      prev1 = rY.length;
+    }
+    const C = [], at = new Map();
+    for (let r = 0; r < rY.length; r++) {
+      const root = find(r);
+      let k = at.get(root);
+      if (k === undefined) { k = C.length; at.set(root, k); C.push({ x0: rA[r], x1: rB[r], y0: rY[r], y1: rY[r], n: 0, runs: [] }); }
+      const c = C[k];
+      if (rA[r] < c.x0) c.x0 = rA[r];
+      if (rB[r] > c.x1) c.x1 = rB[r];
+      if (rY[r] > c.y1) c.y1 = rY[r];
+      c.n += rB[r] - rA[r] + 1;
+      c.runs.push(r);
+    }
+    return { rY, rA, rB, C };
+  }
+  /* Образ знака: насколько темна каждая клетка сетки OCR_GW × OCR_GH (знак растянут на всю сетку), по оттенкам серого:
+     так мелкий и размытый скан сравнивается с образцом лучше, чем по чёрно-белой картинке. Без среднего, длина 1. */
+  function featOf(G, x0, y0, x1, y1) {
+    const { w, h, g } = G, cw = x1 - x0 + 1, ch = y1 - y0 + 1, f = new Float32Array(OCR_GW * OCR_GH);
+    let lo = 255, hi = 0;
+    for (let y = Math.max(0, y0 - 2); y <= Math.min(h - 1, y1 + 2); y++) {
+      for (let x = Math.max(0, x0 - 2); x <= Math.min(w - 1, x1 + 2); x++) { const v = g[y * w + x]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    }
+    const span = Math.max(40, hi - lo), sx = OCR_GW / cw, sy = OCR_GH / ch;
+    for (let y = y0; y <= y1; y++) {
+      const gy0 = (y - y0) * sy, gy1 = gy0 + sy;
+      for (let x = x0; x <= x1; x++) {
+        const ink = Math.min(1, (hi - g[y * w + x]) / span);
+        if (ink <= 0.05) continue;
+        const gx0 = (x - x0) * sx, gx1 = gx0 + sx;
+        for (let gy = Math.floor(gy0); gy < gy1 && gy < OCR_GH; gy++) {
+          const wy = Math.min(gy1, gy + 1) - Math.max(gy0, gy);
+          if (wy <= 0) continue;
+          for (let gx = Math.floor(gx0); gx < gx1 && gx < OCR_GW; gx++) {
+            const wx = Math.min(gx1, gx + 1) - Math.max(gx0, gx);
+            if (wx > 0) f[gy * OCR_GW + gx] += ink * wx * wy;
+          }
+        }
+      }
+    }
+    let mean = 0;
+    for (const v of f) mean += v;
+    mean /= f.length;
+    let ss = 0;
+    for (let i = 0; i < f.length; i++) { f[i] -= mean; ss += f[i] * f[i]; }
+    ss = Math.sqrt(ss) || 1;
+    for (let i = 0; i < f.length; i++) f[i] /= ss;
+    return f;
+  }
+  /* Образцы цифр: рисуются шрифтами Times New Roman (обычный и жирный) и Arial нужной высоты, как на скане */
+  let DIGITS = null;
+  function digitTemplates() {
+    if (DIGITS) return DIGITS;
+    DIGITS = [];
+    const fonts = [['', '"Times New Roman", Times, serif', 0.66], ['bold ', '"Times New Roman", Times, serif', 0.66], ['', 'Arial, Helvetica, sans-serif', 0.72]];
+    for (const px of OCR_SIZES) {
+      for (const [weight, family, k] of fonts) {
+        for (let d = 0; d < 10; d++) {
+          const c = canvasOf(px * 3, px * 3), x = ctx2d(c);
+          x.fillStyle = '#fff';
+          x.fillRect(0, 0, c.width, c.height);
+          x.fillStyle = '#000';
+          x.font = weight + Math.round(px / k) + 'px ' + family;
+          x.fillText(String(d), px * 0.5, px * 2);
+          const G = grayOf(c);
+          let x0 = G.w, y0 = G.h, x1 = -1, y1 = -1;
+          for (let y = 0; y < G.h; y++) for (let xx = 0; xx < G.w; xx++) if (G.g[y * G.w + xx] < 160) { if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+          if (x1 < 0) continue;
+          DIGITS.push({ d, px, f: featOf(G, x0, y0, x1, y1), ar: (x1 - x0 + 1) / (y1 - y0 + 1) });
+        }
+      }
+    }
+    return DIGITS;
+  }
+  /* ИИН: 7-я цифра 3–6 (родился в 1900–2099), дата рождения существует, возраст от 16 до 100 лет */
+  function ocrPlausible(s) {
+    const c = +s[6], yy = +s.slice(0, 2), mm = +s.slice(2, 4), dd = +s.slice(4, 6);
+    if (c < 3 || c > 6) return false;
+    const year = (c <= 4 ? 1900 : 2000) + yy, now = new Date().getFullYear();
+    if (year > now - 16 || year < now - 100) return false;
+    const dt = new Date(year, mm - 1, dd);
+    return dt.getMonth() === mm - 1 && dt.getDate() === dd;
+  }
+  /* ИИН на картинке страницы. G: { w, h, g } (яркость 0..255). [{ iin, conf, score, fixes, x, y }] по порядку на странице */
+  function ocrIins(G, dbg) {
+    const { w, h, g } = G;
+    /* 1. Чёрно-белая: точка тёмная, если темнее средней яркости окна вокруг на 15% (неровная засветка не мешает) */
+    const half = Math.max(7, Math.round(Math.min(w, h) / 100)), W1 = w + 1;
+    const I = new Uint32Array(W1 * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let row = 0;
+      const o = y * w, r0 = y * W1, r1 = r0 + W1;
+      for (let x = 0; x < w; x++) { row += g[o + x]; I[r1 + x + 1] = I[r0 + x + 1] + row; }
+    }
+    /* два порога: светлые штрихи (размытый мелкий скан) остаются, только если касаются явно тёмных: цифры не рвутся на куски */
+    const ink = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const ya = Math.max(0, y - half), yb = Math.min(h, y + half + 1), ra = ya * W1, rb = yb * W1, o = y * w;
+      for (let x = 0; x < w; x++) {
+        const v = g[o + x];
+        if (v > 232) continue;
+        const xa = Math.max(0, x - half), xb = Math.min(w, x + half + 1);
+        const m = (I[rb + xb] - I[ra + xb] - I[rb + xa] + I[ra + xa]) / ((xb - xa) * (yb - ya));
+        if (v < m * 0.93) ink[o + x] = v < m * 0.82 && v < 205 ? 2 : 1;
+      }
+    }
+    /* 2. Знаки: пятна высотой с цифру; 3. цепочки соседних знаков одной высоты на одной строке */
+    const R = componentsOf(ink, w, h);
+    R.C = R.C.filter(c => c.runs.some(r => { const o = R.rY[r] * w; for (let x = R.rA[r]; x <= R.rB[r]; x++) if (ink[o + x] === 2) return true; return false; }));
+    /* куски одного знака друг над другом (у «2» отрывается нижняя черта, у «5» верхняя): склеить */
+    {
+      const C = R.C.filter(c => c.y1 - c.y0 < 100 && c.x1 - c.x0 < 100).sort((a, b) => a.x0 - b.x0);
+      const up = new Map(), top = c => { while (up.has(c)) c = up.get(c); return c; };
+      for (let i = 0; i < C.length; i++) {
+        const a = C[i];
+        for (let j = i + 1; j < C.length && C[j].x0 <= a.x1; j++) {
+          const b = C[j], ov = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) + 1;
+          if (ov < 0.5 * Math.min(a.x1 - a.x0 + 1, b.x1 - b.x0 + 1)) continue;
+          const gap = Math.max(a.y0, b.y0) - Math.min(a.y1, b.y1) - 1, H = Math.max(a.y1, b.y1) - Math.min(a.y0, b.y0) + 1;
+          if (gap > Math.max(2, 0.12 * H) || H > 1.6 * Math.max(a.y1 - a.y0 + 1, b.y1 - b.y0 + 1)) continue;
+          const ra = top(a), rb = top(b);
+          if (ra !== rb) up.set(rb, ra);
+        }
+      }
+      if (up.size) {
+        for (const c of C) {
+          const r = top(c);
+          if (r === c) continue;
+          r.x0 = Math.min(r.x0, c.x0); r.x1 = Math.max(r.x1, c.x1); r.y0 = Math.min(r.y0, c.y0); r.y1 = Math.max(r.y1, c.y1);
+          r.n += c.n; r.runs = r.runs.concat(c.runs); c.gone = true;
+        }
+        R.C = R.C.filter(c => !c.gone);
+      }
+    }
+    const cand = [];
+    for (const c of R.C) {
+      const ch = c.y1 - c.y0 + 1, cw = c.x1 - c.x0 + 1;
+      if (ch < 9 || ch > 100 || cw < 2 || c.n < ch) continue;
+      if (cw <= ch * 1.05) { cand.push(c); continue; }
+      if (cw > ch * 2.9) continue;
+      /* слипшиеся цифры (мелкий скан): пятно делится на k частей по самым светлым столбцам */
+      const k = Math.max(2, Math.round(cw / (ch * 0.62))), prof = new Float32Array(cw);
+      for (const r of c.runs) for (let x = R.rA[r]; x <= R.rB[r]; x++) prof[x - c.x0]++;
+      const bounds = [0];
+      for (let i = 1; i < k; i++) {
+        const mid = Math.round(i * cw / k), rad = Math.max(1, Math.round(cw / k * 0.3));
+        let best = mid;
+        for (let x = Math.max(1, mid - rad); x <= Math.min(cw - 2, mid + rad); x++) if (prof[x] < prof[best]) best = x;
+        bounds.push(best);
+      }
+      bounds.push(cw);
+      for (let i = 0; i < k; i++) {
+        const xa = c.x0 + bounds[i], xb = c.x0 + bounds[i + 1] - 1;
+        const sub = { x0: Infinity, x1: -1, y0: Infinity, y1: -1, n: 0, runs: [] };
+        for (const r of c.runs) {
+          const a = Math.max(R.rA[r], xa), b = Math.min(R.rB[r], xb);
+          if (a > b) continue;
+          sub.n += b - a + 1;
+          if (a < sub.x0) sub.x0 = a;
+          if (b > sub.x1) sub.x1 = b;
+          if (R.rY[r] < sub.y0) sub.y0 = R.rY[r];
+          if (R.rY[r] > sub.y1) sub.y1 = R.rY[r];
+        }
+        if (sub.n && sub.y1 - sub.y0 + 1 >= ch * 0.6) cand.push(sub);
+      }
+    }
+    cand.sort((a, b) => a.x0 - b.x0);
+    if (dbg && dbg.box) {
+      const [bx0, by0, bx1, by1] = dbg.box;
+      dbg.glyphs = R.C.filter(c => c.x1 >= bx0 && c.x0 <= bx1 && c.y1 >= by0 && c.y0 <= by1).map(c => [c.x0, c.y0, c.x1 - c.x0 + 1, c.y1 - c.y0 + 1, c.n, cand.includes(c) ? 1 : 0]);
+      dbg.cand = cand.filter(c => c.x1 >= bx0 && c.x0 <= bx1 && c.y1 >= by0 && c.y0 <= by1).map(c => [c.x0, c.y0, c.x1 - c.x0 + 1, c.y1 - c.y0 + 1]);
+    }
+    for (let i = 0; i < cand.length; i++) {
+      const a = cand[i], ah = a.y1 - a.y0 + 1;
+      let best = null, bestGap = 1e9;
+      for (let j = i + 1; j < cand.length; j++) {
+        const b = cand[j];
+        if (b.x0 > a.x1 + ah) break;
+        const bh = b.y1 - b.y0 + 1, hh = Math.max(ah, bh);
+        if (bh * 1.3 < ah || ah * 1.3 < bh || b.x1 <= a.x1) continue;
+        if (Math.abs(b.y1 - a.y1) > hh * 0.2 || Math.abs(b.y0 - a.y0) > hh * 0.25) continue;
+        const gap = b.x0 - a.x1 - 1;
+        if (gap < -hh * 0.2) continue;
+        if (gap < bestGap) { bestGap = gap; best = b; }
+      }
+      if (best && (!best.prev || best.prevGap > bestGap)) {
+        if (best.prev) best.prev.next = null;
+        best.prev = a;
+        best.prevGap = bestGap;
+        a.next = best;
+      }
+    }
+    const T = digitTemplates();
+    const classify = c => {
+      if (c.cls) return c.cls;
+      const f = featOf(G, c.x0, c.y0, c.x1, c.y1), ch = c.y1 - c.y0 + 1, ar = (c.x1 - c.x0 + 1) / ch;
+      const px = OCR_SIZES.reduce((a, s) => (Math.abs(s - ch) < Math.abs(a - ch) ? s : a), OCR_SIZES[0]);
+      const best = new Array(10).fill(-9);
+      for (const t of T) {
+        if (t.px !== px) continue;
+        let s = 0;
+        for (let i = 0; i < f.length; i++) s += f[i] * t.f[i];
+        s -= 0.5 * Math.abs(Math.log(ar / t.ar));
+        if (s > best[t.d]) best[t.d] = s;
+      }
+      c.cls = best.map((s, d) => ({ d, s })).sort((a, b) => b.s - a.s);
+      return c.cls;
+    };
+    /* 4. Окна по 12 знаков: все похожи на цифры, шаг ровный; ИИН с верной контрольной цифрой и настоящей датой.
+       Не сошлось: одна самая сомнительная цифра заменяется на вторую по сходству (только если та почти так же похожа);
+       такой ИИН помечается «сверить с приказом». Две замены не делаются: на настоящих приказах они давали чужие ИИН. */
+    /* штрихи, черта, буквы «І», «l» читаются как ряд единиц: в настоящем ИИН одна цифра не стоит 5 раз подряд и единиц не больше 6 */
+    const valid = s => iinOk(s) && ocrPlausible(s) && !/(\d)\1{4}/.test(s) && (s.match(/1/g) || []).length <= 6;
+    const found = new Map();
+    for (const start of cand) {
+      if (start.prev) continue;
+      const chain = [];
+      for (let x = start; x && chain.length < 80; x = x.next) chain.push(x);
+      if (dbg && chain.length >= 8) dbg.push({ x: chain[0].x0, y: chain[0].y0, h: chain[0].y1 - chain[0].y0 + 1, n: chain.length,
+        str: chain.map(c => { const k = classify(c); return k[0].s >= 0.3 ? String(k[0].d) : '?'; }).join(''),
+        s: chain.map(c => Math.round(classify(c)[0].s * 100)), top: chain.map(c => classify(c).slice(0, 3).map(x => x.d + ':' + Math.round(x.s * 100)).join(' ')),
+        box: chain.map(c => [c.x0, c.y0, c.x1 - c.x0 + 1, c.y1 - c.y0 + 1]) });
+      if (chain.length < 12) continue;
+      for (let s0 = 0; s0 + 12 <= chain.length; s0++) {
+        const glyphs = chain.slice(s0, s0 + 12);
+        const cx = glyphs.map(c => (c.x0 + c.x1) / 2), steps = cx.slice(1).map((v, i) => v - cx[i]);
+        const med = steps.slice().sort((a, b) => a - b)[5];
+        if (steps.some(v => v > med * 1.9 || v < med * 0.45)) continue;           /* пробел внутри: это не одно число */
+        const win = glyphs.map(classify);
+        if (win.some(x => x[0].s < 0.3)) continue;
+        const base = win.map(x => x[0].d).join(''), sum = win.reduce((a, x) => a + x[0].s, 0);
+        let best = valid(base) ? { iin: base, score: sum / 12, fixes: 0 } : null;
+        if (!best) {
+          const doubt = win.map((x, i) => [x[0].s - x[1].s, i]).filter(x => x[0] < 0.2).sort((a, b) => a[0] - b[0]).slice(0, 4).map(x => x[1]);
+          const alts = p => win[p].slice(1, 3).filter(a => a.s >= win[p][0].s - 0.2);
+          for (const p of doubt) for (const a of alts(p)) {
+            const t = base.slice(0, p) + a.d + base.slice(p + 1), v = (sum - win[p][0].s + a.s) / 12;
+            if (valid(t) && (!best || v > best.score)) best = { iin: t, score: v, fixes: 1 };
+          }
+        }
+        if (!best) continue;
+        const low = Math.min(...win.map(x => x[0].s));
+        best.conf = best.fixes === 0 && low >= 0.45 ? 'high' : 'medium';     /* проверка на 225 приказах: «high» без единой ошибки */
+        best.x = glyphs[0].x0;
+        best.y = glyphs[0].y0;
+        const old = found.get(best.iin);
+        if (!old || old.fixes > best.fixes || (old.fixes === best.fixes && old.score < best.score)) found.set(best.iin, best);
+      }
+    }
+    return Array.from(found.values()).sort((a, b) => (Math.abs(a.y - b.y) > 15 ? a.y - b.y : a.x - b.x));
+  }
+  /* ИИН из файла приказа: текст PDF, иначе распознавание картинки. { iins: [{ iin, conf, how, fixes }], note, pages } */
+  async function readScan(bytes, name) {
+    const ext = ((/\.([a-z0-9]+)$/i.exec(name || '') || [])[1] || '').toLowerCase();
+    const head = latin1(bytes.subarray(0, 8));
+    const isPng = head.startsWith('\x89PNG'), isJpg = head.startsWith('\xff\xd8');
+    const isPdf = head.startsWith('%PDF') || (!isPng && !isJpg && ext === 'pdf');
+    const out = { iins: [], note: '', pages: 0 };
+    const take = (list, how) => { for (const x of list) if (!out.iins.some(y => y.iin === x.iin)) out.iins.push(Object.assign({ how }, x)); };
+    try {
+      const pages = [];
+      if (isPdf) {
+        const lines = await pdfLines(bytes);
+        const ex = extractIins(lines.map((t, i) => ({ row: i + 1, cells: [{ v: clean(t), num: false }] })).filter(r => r.cells[0].v));
+        if (ex.items.length) { take(ex.items.map(x => ({ iin: x.iin, conf: 'high', fixes: 0 })), 'текст PDF'); return out; }
+        const doc = await pdfOpen(bytes);
+        for (const pg of doc.pages.slice(0, OCR_PAGES)) {
+          try { const c = await pdfPageImage(doc, pg, OCR_DPI); if (c) pages.push(c); } catch (e) { out.note = (e && e.message) || String(e); }
+        }
+        if (!pages.length && !out.note) out.note = 'в PDF нет ни ИИН в тексте, ни картинки страницы';
+      } else if (isPng || isJpg || /^(jpe?g|png)$/.test(ext)) {
+        pages.push(await imageFileCanvas(bytes, isPng ? 'image/png' : 'image/jpeg'));
+      } else { out.note = 'не PDF и не картинка'; return out; }
+      out.pages = pages.length;
+      for (const c of pages) {
+        for (const rot of c.width > c.height * 1.15 ? [90, 270, 0, 180] : [0, 180]) {
+          const r = ocrIins(grayOf(rot ? rotated(c, rot) : c));
+          if (r.length) { take(r, 'распознано со скана'); break; }
+          await sleep(0);
+        }
+        if (out.iins.length) break;
+      }
+      const partial = pages.map(c => c.partial).filter(Boolean)[0];
+      if (!out.iins.length && pages.length) out.note = 'ИИН на скане не распознан' + (partial ? ': ' + partial : '');
+    } catch (e) { out.note = (e && e.message) || String(e); }
+    return out;
+  }
+
   /* ====================== Шаг 1: списки ДГД по регионам ====================== */
   /* Списки ДГД (финансовые управляющие) за день кладутся в подпапку «ДГД» рабочей папки: файл на регион, в любом
      из форматов xlsx, csv, docx, html, txt или PDF с текстом. Помощник находит в них ИИН (контрольная цифра и дата
@@ -1060,6 +1626,113 @@
   const UP_ = 'А-ЯЁӘІҢҒҮҰҚӨҺ', LO_ = 'а-яёәіңғүұқөһ';
   const NAME_RE = new RegExp('^[' + UP_ + '][' + UP_ + LO_ + '-]+(?:\\s+[' + UP_ + '](?:[' + UP_ + LO_ + '-]+|\\.)){1,3}$');
   const NAME_IN_TEXT = new RegExp('[' + UP_ + '][' + LO_ + '-]+(?:\\s+[' + UP_ + '][' + LO_ + '-]+){1,3}|[' + UP_ + ']{2,}(?:\\s+[' + UP_ + ']{2,}){1,3}', 'g');
+
+  /* ---------- сайты ДГД: меню, страницы приказов, строки приказов ---------- */
+  /* Сайты 20 регионов (один Drupal на всех). Порядок обхода: по алфавиту, города в конце. */
+  const KGD_SITES = [['abai', 'Абайская обл.'], ['akm', 'Акмолинская обл.'], ['akb', 'Актюбинская обл.'], ['alm', 'Алматинская обл.'],
+    ['atr', 'Атырауская обл.'], ['vko', 'Восточно-Казахстанская обл.'], ['zhmb', 'Жамбылская обл.'], ['zhts', 'Жетысуская обл.'],
+    ['zko', 'Западно-Казахстанская обл.'], ['krg', 'Карагандинская обл.'], ['kst', 'Костанайская обл.'], ['kzl', 'Кызылординская обл.'],
+    ['mng', 'Мангистауская обл.'], ['pvl', 'Павлодарская обл.'], ['sko', 'Северо-Казахстанская обл.'], ['trk', 'Туркестанская обл.'],
+    ['ult', 'Улытауская обл.'], ['astana', 'г. Астана'], ['almaty', 'г. Алматы'], ['shymkent', 'г. Шымкент']];
+  const KGD_START = '/ru/depsection/fizicheskim-licam';     /* раздел «Физическим лицам»: в его меню страницы приказов по годам */
+  const DGD_WINDOW = 31;                  /* приказы за столько дней скачиваются и читаются (старые только считаются) */
+  const DGD_SITE_STALE = 14;              /* последний приказ региона старше стольких дней: проверить */
+  const DGD_META = 'приказы_с_сайта.json';  /* в папке региона: что найдено на сайте при последнем сборе */
+  const DGD_OCR = 'распознано.json';       /* в папке «ДГД»: ИИН, прочитанные из файлов приказов (чтобы не читать заново) */
+  const regionFolder = name => name.replace(/ обл\.$/, ' область');   /* Windows не разрешает точку в конце имени папки */
+  const ORDER_PAGE_RE = rx('приказ\\S*\\s.*?(?:назнач|отстран|освобожд).*?финансов\\S*\\s+управляющ');
+  const NOT_CITIZEN_RE = rx('реабилитац|банкротн\\S*\\s+(?:и\\s+)?управляющ|временн\\S*\\s+управляющ|<<список|<<реестр|объявлени');
+  const N1 = '[' + UP_ + '][' + LO_ + 'ʼ’\'-]+', INI = '[' + UP_ + ']\\.\\s*(?:[' + UP_ + ']\\.?)?';
+  const NAME_ANY = N1 + '\\s+' + INI + '|' + N1 + '(?:\\s+' + N1 + '){1,3}';
+  const NAME_ONLY = new RegExp('^[«"]?(?:' + NAME_ANY + ')[»"]?$');
+  const AFTER = (lead, flags) => new RegExp(lead + '\\s*[«"]?(' + NAME_ANY + ')', flags || '');
+  const DEBTOR_RES = [AFTER('[Пп]о\\s+заявлени\\S*\\s+(?:должник\\S*\\s+|гражданин\\S*\\s+|гр\\.\\s*|ФЛ\\s+)?'),
+    AFTER('[Вв]\\s+отношении\\s+(?:ФЛ\\s+|физическ\\S+\\s+лиц\\S*\\s+|гражданин\\S*\\s+|должник\\S*\\s+)?'), AFTER('(?:^|\\s)ФЛ\\s+')];
+  const MANAGER_RE = AFTER('финансов\\S*\\s+управляющ\\S*\\s+');
+  /* Страницы приказов из меню сайта: [{ url, title, year }]. Страница узнаётся по названию пункта меню или по адресу
+     (у Костаная пункт назван «…реабилитационных, банкротных управляющих», а адрес и содержание: финансовые управляющие).
+     Год из меню («2026 год. …») только для справки: меню у регионов устроены по-разному, поэтому читаются все такие
+     страницы, а свежесть решают даты самих приказов. */
+  const ORDER_SLUG_RE = /prikaz\S*(?:naznach|otstran|osvobozh)\S*finansov\S*upravl/i;
+  function orderPages(html, base) {
+    const doc = new DOMParser().parseFromString(html, 'text/html'), out = [];
+    let year = null;
+    for (const a of doc.querySelectorAll('a[href]')) {
+      if (a.closest('.field-name-body, .node .content, article .content')) continue;     /* ссылки внутри таблицы приказов: это файлы */
+      const t = clean(a.textContent);
+      let u;
+      try { u = new URL(a.getAttribute('href'), base); } catch (e) { continue; }
+      if (!/kgd\.gov\.kz$/i.test(u.hostname) || /\/sites\/default\/files\/|\.(pdf|jpe?g|png|tiff?|docx?|xlsx?|zip|rar)$/i.test(u.pathname)) continue;
+      const y = /(20\d\d)\s*(?:год|жыл)/i.exec(t);
+      const byText = ORDER_PAGE_RE.test(t) && !NOT_CITIZEN_RE.test(t), bySlug = ORDER_SLUG_RE.test(u.pathname);
+      if (!byText && !bySlug) {
+        if (y) year = +y[1];
+        else if (/восстановлени\S*\s+платежеспособ|банкрот/i.test(t)) year = null;            /* раздел без года */
+        continue;
+      }
+      const href = new URL(u.pathname, base).href;                     /* на тот же сайт, где открыто окно */
+      const own = y ? +y[1] : year;
+      const old = out.find(p => p.url === href);
+      if (old) { if (!old.year && own) old.year = own; continue; }
+      out.push({ url: href, title: t.slice(0, 200), year: own });
+    }
+    return out.slice(0, 8);
+  }
+  /* Строки страницы приказов: [{ text, cells, files: [{ url, gov, name }], date, kind, debtor, manager, number }] */
+  function orderRows(html, pageUrl) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const box = doc.querySelector('.field-name-body') || doc.querySelector('.node .content') || doc.querySelector('article') || doc.querySelector('#content') || doc.body;
+    if (!box) return [];
+    let blocks = Array.from(box.querySelectorAll('tr'));
+    if (!blocks.length) blocks = Array.from(box.querySelectorAll('p, li')).filter(e => e.querySelector('a[href]'));
+    const out = [];
+    for (const el of blocks) {
+      const cells = el.tagName === 'TR' ? Array.from(el.children).map(c => clean(c.textContent)) : [clean(el.textContent)];
+      const files = [];
+      for (const a of el.querySelectorAll('a[href]')) {
+        let u;
+        try { u = new URL(a.getAttribute('href'), pageUrl); } catch (e) { continue; }
+        const gov = /(^|\.)gov\.kz$/i.test(u.hostname) && !/kgd\.gov\.kz$/i.test(u.hostname) && /documents|uploads|assets/i.test(u.pathname);
+        const file = /kgd\.gov\.kz$/i.test(u.hostname) && (/\/sites\/default\/files\//i.test(u.pathname) || /\.(pdf|jpe?g|png|tiff?|docx?|zip|rar)$/i.test(u.pathname));
+        if (!file && !gov) continue;
+        if (file) u = new URL(u.pathname, pageUrl);                     /* файл с того же сайта, где открыто окно */
+        if (!files.some(f => f.url === u.href)) {
+          let name = u.pathname.split('/').pop() || '';
+          try { name = decodeURIComponent(name); } catch (e) { /* имя как есть */ }
+          files.push({ url: u.href, gov, name });
+        }
+      }
+      const text = clean(cells.filter(Boolean).join(' | '));
+      if (!files.length && !/\d{1,2}\.\d{1,2}\.\d{2,4}/.test(text)) continue;        /* заголовок или пустая строка */
+      out.push(Object.assign({ text: text.slice(0, 400), cells, files }, orderInfo(cells, files)));
+    }
+    return out;
+  }
+  function orderInfo(cells, files) {
+    const today = new Date();
+    const text = cells.join(' '), dates = [];
+    for (const m of text.matchAll(/(?<!\d)(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})(?!\d)/g)) {
+      const y = m[3].length === 2 ? 2000 + +m[3] : +m[3], d = new Date(y, +m[2] - 1, +m[1]);
+      if (d.getMonth() === +m[2] - 1 && d.getDate() === +m[1] && y >= 2020 && y <= 2100) dates.push(d);
+    }
+    const ok = dates.filter(d => d <= new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1));
+    const date = ok.length ? maxDate(ok) : null;
+    const low = (text + ' ' + files.map(f => f.name).join(' ')).toLowerCase();
+    const kind = /отстран|shettet|шеттет/.test(low) ? 'отстранение' : /освобожд|bosat|босат/.test(low) ? 'освобождение'
+      : /назнач|tagay|тағай/.test(low) ? 'назначение' : '';
+    let debtor = '', manager = '';
+    for (const c of cells) {
+      if (!debtor) for (const re of DEBTOR_RES) { const m = re.exec(c); if (m) { debtor = clean(m[1]); break; } }
+      if (!manager) { const m = MANAGER_RE.exec(c); if (m) manager = clean(m[1]); }
+    }
+    for (const c of cells) {                    /* ячейка только с именем: должник, а если он уже есть, то управляющий */
+      const v = c.replace(/[«»"]/g, '').trim();
+      if (!NAME_ONLY.test(v) || v === debtor || v === manager) continue;
+      if (!debtor) debtor = v; else if (!manager) manager = v;
+    }
+    const num = /(?:№\s*|(?:^|\s)П-\s*)(\d[\d/-]*[А-Яа-я]?)/.exec(text);
+    return { date, kind, debtor, manager, number: num ? num[1] : '', future: dates.length > ok.length };
+  }
 
   /* Строки файла: [{ sheet, row, cells: [{ v, num }] }] */
   async function fileRows(name, bytes) {
@@ -1179,28 +1852,76 @@
     return { items, invalid };
   }
 
-  /* Все файлы подпапки «ДГД» (и её подпапок): ИИН, регионы, даты */
+  /* Все файлы подпапки «ДГД» (и её подпапок): приказы, собранные с сайтов (в папке региона файл DGD_META), и файлы,
+     положенные вручную (списки xlsx, csv, docx, html, PDF, сканы). ИИН из сканов читаются один раз и запоминаются
+     в «ДГД/распознано.json». */
   async function readDgd(dir) {
     let root;
     try { root = await dir.getDirectoryHandle(DGD_DIR); } catch (e) { return null; }
-    const files = [];
+    const files = [], metas = [];
     const walk = async (d, prefix, depth) => {
       for await (const [name, hnd] of d.entries()) {
         if (hnd.kind === 'directory') { if (depth < 2) await walk(hnd, prefix + name + '/', depth + 1); continue; }
-        if (/^(~\$|\.)/.test(name) || /\.(crswap|tmp|ini|db)$/i.test(name)) continue;
+        if (/^(~\$|\.)/.test(name) || /\.(crswap|tmp|ini|db)$/i.test(name) || name === DGD_OCR) continue;
+        if (name === DGD_META) { const data = await readJsonFile(d, name); if (data && data.region) metas.push({ dir: d, folder: prefix.slice(DGD_DIR.length + 1).replace(/\/$/, ''), data }); continue; }
         files.push({ name, path: prefix + name, handle: hnd });
       }
     };
     await walk(root, DGD_DIR + '/', 0);
     files.sort((a, b) => a.path.localeCompare(b.path, 'ru'));
-    const out = { files: [], items: [], at: new Date() };
+    const cache = (await readJsonFile(root, DGD_OCR)) || {};
+    let cacheChanged = false;
+    /* ИИН из файла-скана: из памяти или распознаванием (и запомнить) */
+    const scanOf = async (key, handle, name) => {
+      const file = await handle.getFile();
+      const hit = cache[key];
+      if (hit && hit.size === file.size && Array.isArray(hit.iins)) return hit;
+      const r = await readScan(new Uint8Array(await file.arrayBuffer()), name);
+      cache[key] = { size: file.size, at: new Date().toISOString(), note: r.note || '', iins: r.iins.map(x => ({ iin: x.iin, conf: x.conf, how: x.how, fixes: x.fixes || 0 })) };
+      cacheChanged = true;
+      return cache[key];
+    };
+    const out = { files: [], items: [], orders: [], sites: [], at: new Date() };
+    const used = new Set();
+    for (const m of metas.sort((a, b) => a.folder.localeCompare(b.folder, 'ru'))) {
+      const meta = m.data, region = meta.region;
+      const site = { region, host: meta.host || '', state: meta.state || 'ok', note: meta.note || '', collectedAt: meta.collectedAt ? new Date(meta.collectedAt) : null,
+        failedAt: meta.failedAt ? new Date(meta.failedAt) : null, window: meta.window || DGD_WINDOW, pages: meta.pages || [], rows: [] };
+      for (const r of meta.rows || []) {
+        const row = { region, date: r.date ? new Date(r.date + 'T00:00:00') : null, dateFrom: r.dateFrom || '', kind: r.kind || '', debtor: r.debtor || '',
+          manager: r.manager || '', number: r.number || '', text: r.text || '', page: r.page || '', future: !!r.future, firstSeen: r.firstSeen || '',
+          files: [], iins: [], gov: (r.files || []).some(f => f.gov), notes: [] };
+        for (const f of r.files || []) {
+          const file = { url: f.url, name: f.name, gov: !!f.gov, saved: f.saved || '', err: f.err || '', path: '' };
+          row.files.push(file);
+          if (!f.saved) continue;
+          file.path = DGD_DIR + '/' + m.folder + '/' + f.saved;
+          used.add(file.path);
+          let res;
+          try { res = await scanOf(m.folder + '/' + f.saved, await m.dir.getFileHandle(f.saved), f.saved); }
+          catch (e) { res = { iins: [], note: 'файла нет в папке' }; }
+          if (res.note && !res.iins.length) row.notes.push(res.note);
+          for (const x of res.iins) if (!row.iins.some(y => y.iin === x.iin)) row.iins.push(Object.assign({ path: file.path }, x));
+        }
+        site.rows.push(row);
+        out.orders.push(row);
+        for (const x of row.iins) {
+          out.items.push({ iin: x.iin, fio: row.debtor, mgr: row.manager, date: row.date, listDate: row.date, region, path: x.path, kind: row.kind,
+            conf: x.conf, how: x.how, page: row.page, where: 'приказ' + (row.kind ? ' о ' + ({ 'назначение': 'назначении', 'отстранение': 'отстранении', 'освобождение': 'освобождении' }[row.kind] || row.kind) : '') +
+              (row.number ? ' № ' + row.number : '') + (row.date ? ' от ' + dmy(row.date) : '') });
+        }
+      }
+      out.sites.push(site);
+    }
     for (const f of files) {
+      if (used.has(f.path)) continue;
       const rec = { path: f.path, name: f.name, region: '', kind: '', listDate: null, lastDate: null, count: 0, unique: 0, invalid: [], note: '' };
       const fromPath = regionsIn(f.path.slice(DGD_DIR.length + 1), true);      /* регион по имени: известен, даже если файл не прочитан */
       if (fromPath.length === 1) rec.region = fromPath[0];
       try {
         const file = await f.handle.getFile();
-        const parsed = await fileRows(f.name, new Uint8Array(await file.arrayBuffer()));
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const parsed = await fileRows(f.name, bytes);
         rec.kind = parsed.kind;
         rec.note = parsed.note || '';
         const ex = extractIins(parsed.rows);
@@ -1212,6 +1933,12 @@
         if (regs.length > 1) rec.note = (rec.note ? rec.note + '; ' : '') + 'несколько регионов в названии: ' + regs.join(', ') + ' (переименуйте файл)';
         const nameDates = datesIn(f.path);
         rec.listDate = maxDate(nameDates) || null;
+        if (!ex.items.length && /скан|картинка/.test(rec.note)) {            /* скан или фото приказа: ИИН читается с картинки */
+          const r = await scanOf(f.path.slice(DGD_DIR.length + 1), f.handle, f.name);
+          for (const x of r.iins) ex.items.push({ iin: x.iin, fio: '', mgr: '', date: rec.listDate, where: x.how + (x.conf !== 'high' ? ' (сверить с приказом)' : ''), conf: x.conf, how: x.how });
+          rec.note = r.iins.length ? (rec.kind === 'PDF' ? 'скан PDF' : 'картинка (скан)') + ': ИИН ' + (r.iins.every(x => x.conf === 'high') ? 'распознан' : 'распознан неуверенно, сверить с приказом')
+            : rec.note.replace(/: ИИН не прочитаны, нужна проверка вручную/, '') + ': ИИН не распознан, нужна проверка вручную' + (r.note && !/не распознан/.test(r.note) ? ' (' + r.note + ')' : '');
+        }
         rec.lastDate = maxDate(ex.items.map(x => x.date));
         if (!rec.listDate) rec.listDate = rec.lastDate || null;
         if (!rec.listDate) { rec.listDate = new Date(file.lastModified); rec.dateNote = 'дата списка не найдена: взято время файла'; }
@@ -1223,56 +1950,109 @@
       } catch (e) { rec.note = 'не прочитан: ' + (e && e.message ? e.message : e); rec.failed = true; }
       out.files.push(rec);
     }
+    if (cacheChanged) { try { await writeJsonFile(root, DGD_OCR, cache); } catch (e) { /* прочитается снова */ } }
     out.byIin = new Map();
     for (const x of out.items) { if (!out.byIin.has(x.iin)) out.byIin.set(x.iin, []); out.byIin.get(x.iin).push(x); }
     out.regions = dgdRegions(out);
     return out;
   }
 
-  /* Проверка регионов: есть ли список, сколько ИИН, свежие ли даты. Всегда все 20 регионов, чтобы пустые были видны. */
+  /* Проверка регионов: всегда все 20, чтобы пустые были видны. По сайту: открылся ли, есть ли страница приказов,
+     сколько приказов за DGD_WINDOW дней и за год, свежий ли последний, прочитаны ли ИИН. По файлам: как раньше. */
   function dgdRegions(dg) {
     const today = new Date(); today.setHours(0, 0, 0, 0);
+    const days = d => Math.floor((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
     const names = REGION_LIST.map(x => x[0]).concat(dg.files.some(f => !f.region) ? ['Регион не определён'] : []);
     return names.map(name => {
       const files = dg.files.filter(f => (f.region || 'Регион не определён') === name);
       const items = dg.items.filter(x => (x.region || 'Регион не определён') === name);
+      const fileItems = items.filter(x => !x.page);
       const unique = new Set(items.map(x => x.iin)).size;
       const invalid = files.reduce((a, f) => a + f.invalid.length, 0);
-      const listDate = maxDate(files.map(f => f.listDate)), lastDate = maxDate(items.map(x => x.date));
-      const newest = maxDate([listDate, lastDate]);
-      const age = newest ? Math.floor((today - new Date(newest.getFullYear(), newest.getMonth(), newest.getDate())) / 86400000) : null;
+      const listDate = maxDate(files.map(f => f.listDate)), lastDate = maxDate(fileItems.map(x => x.date));
+      const site = (dg.sites || []).find(s => s.region === name) || null;
       const problems = [];
       let level = 'good';
       const bad = t => { problems.push(t); level = 'bad'; };
       const warn = t => { problems.push(t); if (level !== 'bad') level = 'warn'; };
-      if (!files.length) bad('нет списка');
-      else if (files.every(f => f.failed)) bad('файл не прочитан');
-      else if (!unique) bad('0 ИИН' + (files.some(f => f.note) ? ': ' + files.map(f => f.note).filter(Boolean)[0] : ''));
-      else if (unique <= DGD_FEW) warn('всего ' + unique + ' ИИН: проверить вручную');
-      if (files.length && age !== null && age > DGD_STALE_DAYS) warn('самая свежая дата ' + dmy(newest) + ': ' + age + ' дн. назад');
-      if (files.some(f => f.dateNote)) warn('дата списка не найдена');
-      if (invalid) warn('неверных ИИН: ' + invalid);
-      const unread = files.filter(f => f.failed || /не прочитан|скан|картинка|старый формат|не поддерживается/.test(f.note || '')).length;
-      if (unread && files.length > unread) warn('не прочитано файлов: ' + unread);
-      if (name === 'Регион не определён') warn('укажите регион в имени файла');
-      return { name, files, items: items.length, unique, invalid, listDate, lastDate, level, text: problems.length ? problems.join('; ') : 'в порядке' };
+      const r = { name, files, items: items.length, unique, invalid, listDate, lastDate, site, level, text: '' };
+      if (site) {
+        const since = new Date(today); since.setDate(since.getDate() - (site.window || DGD_WINDOW));
+        const win = site.rows.filter(x => x.date && x.date >= since), year = site.rows.filter(x => x.date && x.date.getFullYear() === today.getFullYear());
+        const last = maxDate(site.rows.map(x => x.date));
+        Object.assign(r, { win: win.length, year: year.length, lastOrder: last, read: win.filter(x => x.iins.length).length,
+          unread: win.filter(x => !x.iins.length && x.files.some(f => f.saved)).length, pages: site.pages.length });
+        const when = site.collectedAt ? ' (собрано ' + dmy(site.collectedAt) + ')' : '';
+        if (site.state === 'skip') bad('сайт не открылся' + (site.rows.length ? '; приказы с прошлого сбора' + when : ''));
+        else if (site.state !== 'ok') bad((site.note || 'сбор не удался') + (site.rows.length ? '; приказы с прошлого сбора' + when : ''));
+        if (site.state !== 'ok') { /* причина уже названа */ }
+        else if (!site.pages.length) bad('на сайте не найдена страница приказов');
+        else if (!site.pages.some(p => p.read)) bad('страницы приказов не открылись');
+        else if (!site.rows.length) bad('на страницах приказов нет строк');
+        else if (!win.length) bad('0 приказов за ' + (site.window || DGD_WINDOW) + ' дн.');
+        else if (win.length <= DGD_FEW) warn('всего ' + win.length + ' приказ' + (win.length === 1 ? '' : 'а') + ' за ' + (site.window || DGD_WINDOW) + ' дн.: проверить на сайте');
+        if (last && days(last) > DGD_SITE_STALE) warn('последний приказ ' + dmy(last) + ': ' + days(last) + ' дн. назад');
+        if (r.unread) warn('ИИН не прочитан в приказах: ' + r.unread + ' (открыть файл, сверить вручную)');
+        const doubt = win.filter(x => x.iins.some(y => y.conf !== 'high')).length;
+        if (doubt) warn('ИИН прочитан неуверенно: ' + doubt + ' (сверить с приказом)');
+        const gov = win.filter(x => x.gov && !x.files.some(f => f.saved)).length;
+        if (gov) warn('приказы на gov.kz: ' + gov + ' (скачать вручную в папку региона)');
+        const undated = site.rows.filter(x => !x.date).length;
+        if (undated) warn('строк без даты: ' + undated);
+        const future = site.rows.filter(x => x.future).length;
+        if (future) warn('дата приказа в будущем: ' + future);
+        if (site.state === 'ok' && site.rows.length && !year.length && today.getMonth() > 0) warn('приказов за ' + today.getFullYear() + ' год на сайте нет');
+      }
+      if (files.length || !site) {
+        const newest = maxDate([listDate, lastDate]);
+        const age = newest ? days(newest) : null;
+        const fileUnique = new Set(fileItems.map(x => x.iin)).size;
+        if (!files.length) bad(site ? '' : 'нет списка');
+        else if (files.every(f => f.failed)) bad('файл не прочитан');
+        else if (!fileUnique) bad('0 ИИН' + (files.some(f => f.note) ? ': ' + files.map(f => f.note).filter(Boolean)[0] : ''));
+        else if (fileUnique <= DGD_FEW && !site) warn('всего ' + fileUnique + ' ИИН: проверить вручную');
+        if (files.length && age !== null && age > DGD_STALE_DAYS) warn('самая свежая дата ' + dmy(newest) + ': ' + age + ' дн. назад');
+        if (files.some(f => f.dateNote)) warn('дата списка не найдена');
+        if (invalid) warn('неверных ИИН: ' + invalid);
+        const unread = files.filter(f => f.failed || /не прочитан|не распознан|старый формат|не поддерживается/.test(f.note || '')).length;
+        if (unread && files.length > unread) warn('не прочитано файлов: ' + unread);
+        if (name === 'Регион не определён') warn('укажите регион в имени файла');
+      }
+      r.level = level;
+      r.text = problems.filter(Boolean).length ? problems.filter(Boolean).join('; ') : 'в порядке';
+      return r;
     });
   }
 
   async function dgdWorkbook(dg) {
     const lvl = { bad: STYLE.bad, warn: STYLE.warn, good: STYLE.good };
-    const regionRows = [['Регион', 'Проверка', 'Файлов', 'Строк с ИИН', 'Уникальных ИИН', 'Неверных ИИН', 'Дата списка', 'Последняя дата в списке', 'Файлы']]
-      .concat(dg.regions.map(r => [r.name, { v: r.text, s: lvl[r.level] }, String(r.files.length), String(r.items), String(r.unique), String(r.invalid),
-        dmy(r.listDate), dmy(r.lastDate), r.files.map(f => f.path).join('; ')]));
+    const link = (v, to) => (to ? { v, link: to } : v);
+    const regionRows = [['Регион', 'Проверка', 'Сайт ДГД: сбор', 'Последний приказ', 'Приказов за ' + DGD_WINDOW + ' дн.', 'Приказов за год', 'ИИН прочитан',
+      'ИИН не прочитан', 'Файлов вручную', 'Уникальных ИИН', 'Неверных ИИН', 'Дата списка (файлы)', 'Страницы приказов на сайте', 'Файлы']]
+      .concat(dg.regions.map(r => [r.name, { v: r.text, s: lvl[r.level] },
+        r.site ? (r.site.state === 'ok' ? dmy(r.site.collectedAt) : 'не открылся ' + dmy(r.site.failedAt || r.site.collectedAt)) : 'нет',
+        dmy(r.lastOrder), r.site ? String(r.win) : '', r.site ? String(r.year) : '', r.site ? String(r.read) : '', r.site ? String(r.unread) : '',
+        String(r.files.length), String(r.unique), String(r.invalid), dmy(r.listDate),
+        r.site ? r.site.pages.map(p => (p.year ? p.year + ': ' : '') + p.url).join('\n') : '', r.files.map(f => f.path).join('; ')]));
+    const conf = x => (x.conf === 'high' || !x.conf ? '' : ' (сверить)');
+    const orderRowsOut = [['Регион', 'Дата приказа', 'Вид', 'Должник (как на сайте)', 'Финансовый управляющий', 'ИИН', 'Как прочитан ИИН', 'Файл приказа', 'Страница на сайте', 'Впервые увиден']]
+      .concat((dg.orders || []).slice().sort((a, b) => (b.date || 0) - (a.date || 0)).map(o => {
+        const f = o.files.find(x => x.saved) || o.files[0] || {};
+        return [o.region, dmy(o.date) + (o.dateFrom ? ' (' + o.dateFrom + ')' : ''), o.kind, o.debtor, o.manager,
+          o.iins.length ? { v: o.iins.map(x => x.iin).join(', '), s: o.iins.some(x => x.conf !== 'high') ? STYLE.warn : 0 } : (f.saved ? { v: 'не прочитан', s: STYLE.warn } : ''),
+          o.iins.map(x => x.how + conf(x)).join('; ') || o.notes.join('; ') || (f.gov ? 'файл на gov.kz' : f.err || (f.saved ? '' : 'файл не скачивался (старше ' + DGD_WINDOW + ' дн.)')),
+          f.saved ? link(f.path.slice(DGD_DIR.length + 1), f.path) : link(f.url || '', f.url), link(o.page, o.page), o.firstSeen];
+      }));
     const iinRows = [['ИИН', 'ФИО в списке', 'Регион', 'Дата в строке', 'Финансовый управляющий', 'Дата списка', 'Файл', 'Где в файле']]
-      .concat(dg.items.map(x => [x.iin, x.fio, x.region || 'не определён', dmy(x.date), x.mgr, dmy(x.listDate), { v: x.path, link: x.path }, x.where]));
+      .concat(dg.items.map(x => [x.iin, x.fio, x.region || 'не определён', dmy(x.date), x.mgr, dmy(x.listDate), { v: x.path, link: x.path }, x.where + conf(x)]));
     const fileRowsOut = [['Файл', 'Регион', 'Формат', 'Дата списка', 'Строк с ИИН', 'Уникальных ИИН', 'Неверных ИИН', 'Примечание']]
       .concat(dg.files.map(f => [{ v: f.path, link: f.path }, f.region || 'не определён', f.kind, dmy(f.listDate), String(f.count), String(f.unique),
         String(f.invalid.length), { v: [f.note, f.dateNote].concat(f.invalid.slice(0, 5).map(x => x.where + ': ' + x.raw + ' (' + x.err + ')')).filter(Boolean).join('; '),
-          s: f.failed || f.note ? STYLE.warn : 0 }]));
+          s: f.failed || (f.note && !/распознан$/.test(f.note)) ? STYLE.warn : 0 }]));
     return makeXlsx([
-      { name: 'Регионы', rows: regionRows, widths: [30, 60, 9, 13, 16, 14, 13, 22, 60] },
-      { name: 'ИИН', rows: iinRows, widths: [15, 36, 28, 14, 36, 13, 40, 22] },
+      { name: 'Регионы', rows: regionRows, widths: [30, 60, 16, 14, 12, 12, 11, 12, 10, 12, 11, 14, 70, 50] },
+      { name: 'Приказы', rows: orderRowsOut, widths: [26, 14, 14, 36, 32, 15, 26, 46, 50, 12] },
+      { name: 'ИИН', rows: iinRows, widths: [15, 36, 28, 14, 36, 13, 40, 30] },
       { name: 'Файлы', rows: fileRowsOut, widths: [44, 28, 10, 13, 13, 16, 14, 70] },
     ]);
   }
@@ -1375,7 +2155,18 @@
   /* ИИН из списков ДГД готовым списком для SQL (шаг 2: выгрузка ADW только по этим ИИН) */
   const sqlB = button('ИИН для SQL ⧉', copySql, false, 'Скопировать ИИН из списков ДГД в виде VALUES (...) для запроса к ADW');
   dgdDetails.append(dgdHead, dgdList);
-  dgdBox.append(dgdDetails, row(dgdB, sqlB));
+  /* Сбор приказов с сайтов ДГД 20 регионов: окно сайта + закладка в нём (см. relay) */
+  const collectB = button('🌐 Собрать ДГД с сайтов', () => collectDgd(), true,
+    'Помощник по очереди откроет сайты ДГД 20 регионов, скачает приказы о финансовых управляющих за ' + DGD_WINDOW +
+    ' дней в подпапку «' + DGD_DIR + '» и прочитает в них ИИН. В каждом окне сайта нажмите закладку Tazalau.');
+  const collectBox = h('div', 'display:none;white-space:pre-line;max-height:240px;overflow:auto;margin:2px 0 4px;padding:4px 6px;' +
+    'background:#fff;border:1px solid #d5dbe5;border-radius:4px;font-size:12px');
+  collectBox.id = 'tazalau-collect';
+  const skipB = button('Пропустить регион', () => skipSite(), false, 'Сайт этого региона не открывается: отметить его и перейти к следующему');
+  const stopCollectB = button('Закончить сбор', () => finishCollect('остановлено'), false, 'Остановить сбор: всё собранное сохранится');
+  const collectCtl = row(skipB, stopCollectB);
+  collectCtl.style.display = 'none';
+  dgdBox.append(row(collectB), collectBox, collectCtl, dgdDetails, row(dgdB, sqlB));
   const badBox = h('details', 'display:none;margin:0 0 6px;color:#9a3412;font-size:12px');
   const badHead = h('summary', 'cursor:pointer');
   const badList = h('div', 'white-space:pre-line;max-height:140px;overflow:auto');
@@ -1568,11 +2359,11 @@
     if (dgd === 'reading') { dgdHead.textContent = 'ДГД: читаю списки…'; dgdList.textContent = ''; return; }
     if (!dgd) {
       dgdHead.textContent = 'ДГД: подпапки «' + DGD_DIR + '» нет';
-      dgdList.textContent = 'Чтобы сверить ИИН со списками ДГД (финансовые управляющие), положите скачанные списки регионов в подпапку «' +
-        DGD_DIR + '» этой папки: файл на регион, в имени файла регион и дата. Затем выберите папку заново.';
+      dgdList.textContent = 'Нажмите «Собрать ДГД с сайтов»: помощник сам скачает приказы о финансовых управляющих всех 20 регионов в подпапку «' +
+        DGD_DIR + '» и прочитает ИИН. Списки, скачанные вручную, тоже можно положить в «' + DGD_DIR + '»: файл на регион, в имени регион и дата.';
       return;
     }
-    const withList = dgd.regions.filter(r => r.files.length && r.name !== 'Регион не определён').length;
+    const withList = dgd.regions.filter(r => (r.files.length || r.site) && r.name !== 'Регион не определён').length;
     const issues = dgd.regions.filter(r => r.level !== 'good');
     dgdHead.textContent = 'ДГД: регионов со списком ' + withList + ' из ' + REGION_LIST.length + ' · ИИН ' + dgd.byIin.size +
       (issues.length ? ' · ⚠ проверить: ' + issues.length : ' ✔');
@@ -1616,13 +2407,42 @@
     }
     say('✔ Скопировано ИИН: ' + list.length + '. Вставьте в запрос ADW вместо строки «VALUES (...)» в блоке dgd(iin).');
   }
-  /* Столбец «ДГД» рабочего файла: регион, дата списка, финансовый управляющий; ссылка на файл ДГД */
+  /* Один ли человек: имя с сайта ДГД (в любом падеже, иногда с инициалами) и ФИО из рабочего файла */
+  const KZ_RU = { 'ә': 'а', 'і': 'и', 'ң': 'н', 'ғ': 'г', 'ү': 'у', 'ұ': 'у', 'қ': 'к', 'ө': 'о', 'һ': 'х', 'ё': 'е', 'й': 'и' };
+  const nameParts = v => String(v || '').toLowerCase().replace(/[әіңғүұқөһёй]/g, ch => KZ_RU[ch]).replace(/[^а-яa-z\s.-]/g, ' ').split(/[\s.]+/).filter(Boolean);
+  function samePerson(a, b) {
+    const A = nameParts(a), B = nameParts(b);
+    if (A.length < 2 || B.length < 2) return false;
+    const stem = w => (w.length > 5 ? w.slice(0, -2) : w.slice(0, Math.max(3, w.length - 1)));
+    const sa = stem(A[0]), sb = stem(B[0]);
+    if (Math.min(sa.length, sb.length) < 3 || !(sa.startsWith(sb) || sb.startsWith(sa))) return false;
+    if (A[1][0] !== B[1][0] || (A[1].length > 2 && B[1].length > 2 && A[1].slice(0, 3) !== B[1].slice(0, 3))) return false;
+    return !(A[2] && B[2] && A[2][0] !== B[2][0]);
+  }
+  const dgdLine = x => (x.page
+    ? x.region + ', ' + x.where + (x.mgr ? ', управляющий: ' + x.mgr : '') + (x.conf && x.conf !== 'high' ? ', ИИН прочитан со скана неуверенно: сверить с приказом' : '')
+    : (x.region || 'регион не определён') + ', список от ' + dmy(x.listDate) + (x.date ? ', дата ' + dmy(x.date) : '') + (x.mgr ? ', управляющий: ' + x.mgr : '') +
+      (x.conf && x.conf !== 'high' ? ', ИИН прочитан со скана неуверенно' : ''));
+  /* Столбец «ДГД» рабочего файла: регион, приказ или список, финансовый управляющий; ссылка на файл ДГД.
+     Приказ, где ИИН не прочитан, сверяется по ФИО: такая строка помечается «возможно» и жёлтым. */
   async function fillDgd(S) {
     const L = S.layout;
+    const blind = (dgd.orders || []).filter(o => !o.iins.length && o.debtor);
     let marked = 0;
     for (const t of tasks) {
       const hits = t.parse.iin ? dgd.byIin.get(t.parse.iin) || [] : [];
       try {
+        const maybe = !hits.length && t.fio ? blind.filter(o => samePerson(o.debtor, t.fio)) : [];
+        if (maybe.length) {
+          const o = maybe[0], f = o.files.find(x => x.saved) || o.files[0] || {};
+          const cur = (S.cells.get(t.row) || new Map()).get(L.dgdCol);
+          setText(S, t.row, L.dgdCol, ('⚠ возможно (по ФИО, ИИН в приказе не прочитан): ' + maybe.map(m => m.region + ', «' + m.debtor + '», приказ' +
+            (m.date ? ' от ' + dmy(m.date) : '') + (m.manager ? ', управляющий: ' + m.manager : '')).join('; ')).slice(0, 32000),
+            f.path || f.url ? await linkStyle(S, cur ? cur.getAttribute('s') : null) : null);
+          if (f.path || f.url) await setLink(S, t.row, L.dgdCol, f.path || f.url);
+          marked++;
+          continue;
+        }
         if (!hits.length) {
           const cur = (S.cells.get(t.row) || new Map()).get(L.dgdCol);
           if (cur && clean(textAt(S, t.row, L.dgdCol))) { setText(S, t.row, L.dgdCol, '', null); await dropLink(S, t.row, L.dgdCol); }
@@ -1633,7 +2453,7 @@
           const k = x.region + '|' + dmy(x.listDate) + '|' + x.path;
           if (seen.has(k)) continue;
           seen.add(k);
-          parts.push((x.region || 'регион не определён') + ', список от ' + dmy(x.listDate) + (x.date ? ', дата ' + dmy(x.date) : '') + (x.mgr ? ', управляющий: ' + x.mgr : ''));
+          parts.push(dgdLine(x));
         }
         const cur = (S.cells.get(t.row) || new Map()).get(L.dgdCol);
         setText(S, t.row, L.dgdCol, parts.join('; ').slice(0, 32000), await linkStyle(S, cur ? cur.getAttribute('s') : null));
@@ -1643,12 +2463,250 @@
     }
     return marked;
   }
+  /* ---------- сбор с сайтов ДГД ---------- */
+  let collect = null;                  /* идёт сбор: { sites, popup, origin, pending, seq, cur, ocr, cache, … } */
+  async function readJsonFile(dir, name) {
+    try { return JSON.parse((await (await (await dir.getFileHandle(name)).getFile()).text()).replace(/^\ufeff/, '')); } catch (e) { return null; }
+  }
+  async function writeJsonFile(dir, name, obj) { await writeFile(dir, name, new Blob([JSON.stringify(obj, null, 1)], { type: 'application/json' })); }
+  const isoDay = d => (d ? d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) : '');
+  const siteUrl = s => 'https://' + s.host + (s.start || KGD_START);
+  function collectDgd() {
+    if (running) return;
+    if (!store.dir) { say('Сначала выберите папку (📁 Папка с Excel): в её подпапку «' + DGD_DIR + '» помощник сложит приказы ДГД.'); return; }
+    if (collect) { try { collect.popup.focus(); } catch (e) { /* окно закрыто */ } return; }
+    const sites = KGD_SITES.map(([key, name]) => ({ key, name, host: key + '.kgd.gov.kz', state: 'wait', note: '', got: null }));
+    /* Сайт открывается сразу по нажатию кнопки (иначе браузер заблокирует) в новой обычной вкладке: в ней видна панель
+       закладок (у всплывающего окна её нет, и нажать закладку было бы нечем) */
+    const popup = window.open(siteUrl(sites[0]), 'tazalau_dgd');
+    if (!popup) { say('❌ Браузер не дал открыть вкладку сайта ДГД. Разрешите всплывающие окна для tazalau.qoldau.kz (значок справа в адресной строке) и нажмите кнопку ещё раз.'); return; }
+    collect = { sites, popup, origin: '', pending: new Map(), seq: 0, cur: sites[0], ocr: Promise.resolve(), ocrLeft: 0, cache: null, started: new Date() };
+    sites[0].state = 'open';
+    collect.watch = setInterval(() => { if (collect && collect.popup && collect.popup.closed && !collect.finishing) finishCollect('окно сайта закрыто'); }, 1500);
+    showCollect();
+    updateButtons();
+  }
+  function showCollect(final) {
+    const c = collect;
+    collectCtl.style.display = c && !c.finishing ? '' : 'none';
+    collectB.style.display = c ? 'none' : '';
+    if (!c && !final) { collectBox.style.display = 'none'; return; }
+    collectBox.style.display = 'block';
+    if (final) { collectBox.textContent = final; return; }
+    const icon = { wait: '·', open: '⏳', work: '⏬', done: '✔', fail: '❌', skip: '⏭' };
+    const lines = c.sites.map(s => icon[s.state] + ' ' + s.name + (s.state === 'open' ? ': во вкладке сайта нажмите закладку Tazalau' : s.note ? ': ' + s.note : ''));
+    const done = c.sites.filter(s => /done|fail|skip/.test(s.state)).length;
+    collectBox.textContent = 'Сбор ДГД: ' + done + ' из ' + c.sites.length + (c.ocrLeft ? ' · читаю ИИН: ' + c.ocrLeft : '') + '\n' + lines.join('\n');
+  }
+  function tell(text) { try { if (collect && collect.origin) collect.popup.postMessage({ tz: 'say', text }, collect.origin); } catch (e) { /* окно закрыто */ } }
+  function relayFetch(url, ms, method) {
+    const c = collect;
+    return new Promise((resolve, reject) => {
+      if (!c || c.finishing) { reject(new Error('сбор остановлен')); return; }
+      const id = ++c.seq;
+      const t = setTimeout(() => { c.pending.delete(id); reject(new Error('окно сайта не ответило')); }, ms || 90000);
+      c.pending.set(id, m => { clearTimeout(t); resolve(m); });
+      try { c.popup.postMessage({ tz: 'fetch', id, url, method: method || 'GET' }, c.origin); } catch (e) { clearTimeout(t); c.pending.delete(id); reject(e); }
+    });
+  }
+  function onRelay(e) {
+    const c = collect, m = e.data;
+    if (!c || !m || typeof m.tz !== 'string' || e.source !== c.popup) return;
+    if (!/^https:\/\/([a-z0-9-]+\.)*kgd\.gov\.kz$/i.test(e.origin)) return;
+    if (m.tz === 'fetched') { const p = c.pending.get(m.id); if (p) { c.pending.delete(m.id); p(m); } return; }
+    if (m.tz === 'hello') siteHello(e.origin, m);
+  }
+  window.addEventListener('message', onRelay);
+  async function siteHello(origin, m) {
+    const c = collect;
+    const key = new URL(origin).hostname.replace(/^www\./, '').split('.')[0];
+    const s = c.sites.find(x => x.key === key);
+    if (!s) { c.origin = origin; tell('Этот сайт не из списка 20 регионов. Окно перейдёт к нужному сайту.'); openNext(); return; }
+    if (s.state === 'work') return;                      /* закладку нажали второй раз */
+    c.origin = origin;
+    c.cur = s;
+    s.state = 'work';
+    s.note = 'скачиваю';
+    showCollect();
+    try { await harvest(s, m); s.state = 'done'; }
+    catch (err) { s.state = 'fail'; s.note = (err && err.message) || String(err); await saveSiteFail(s); }
+    showCollect();
+    if (collect === c && !c.finishing) openNext();
+  }
+  function openNext() {
+    const c = collect;
+    const next = c.sites.find(x => x.state === 'wait');
+    if (!next) { finishCollect(''); return; }
+    next.state = 'open';
+    c.cur = next;
+    c.origin = '';
+    try { c.popup.location.href = siteUrl(next); } catch (e) { finishCollect('окно сайта закрыто'); return; }
+    showCollect();
+  }
+  function skipSite() {
+    const c = collect;
+    if (!c || !c.cur || c.cur.state === 'work') return;
+    c.cur.state = 'skip';
+    c.cur.note = 'сайт не открылся (пропущен)';
+    saveSiteFail(c.cur);
+    openNext();
+  }
+  async function regionDirOf(name) {
+    const root = await store.dir.getDirectoryHandle(DGD_DIR, { create: true });
+    return root.getDirectoryHandle(regionFolder(name), { create: true });
+  }
+  /* Сайт не открылся: в сводке это видно, а приказы прошлого сбора остаются (с пометкой) */
+  async function saveSiteFail(s) {
+    try {
+      const dir = await regionDirOf(s.name);
+      const old = (await readJsonFile(dir, DGD_META)) || { region: s.name, host: s.host, pages: [], rows: [] };
+      old.state = s.state === 'skip' ? 'skip' : 'fail';
+      old.note = s.note;
+      old.failedAt = new Date().toISOString();
+      await writeJsonFile(dir, DGD_META, old);
+    } catch (e) { /* папка недоступна: в окне видно */ }
+  }
+  /* Один регион: меню → страницы приказов (этот и прошлый год) → строки → новые файлы за DGD_WINDOW дней */
+  async function harvest(s, hello) {
+    const html = b => decodeText(new Uint8Array(b));
+    tell(s.name + ': ищу страницы приказов в меню сайта…');
+    let pages = orderPages(hello.html || '', hello.href);
+    for (const path of [KGD_START, '/ru']) {
+      if (pages.length) break;
+      const r = await relayFetch(new URL(path, hello.href).href);
+      if (r.ok && r.bytes) pages = orderPages(html(r.bytes), r.url || hello.href);
+    }
+    if (!pages.length) throw new Error('в меню сайта нет страницы «Приказы о назначении … финансового управляющего»');
+    const dir = await regionDirOf(s.name);
+    const old = (await readJsonFile(dir, DGD_META)) || { rows: [] };
+    const savedBefore = new Map(), seenBefore = new Map(), datedBefore = new Map();
+    for (const r of old.rows || []) {
+      seenBefore.set(r.key, r.firstSeen);
+      if (r.date && r.dateFrom) datedBefore.set(r.key, r.date);
+      for (const f of r.files || []) if (f.saved) savedBefore.set(f.url, f.saved);
+    }
+    const yearNow = new Date().getFullYear(), rows = [];
+    const want = pages;
+    for (const [i, p] of want.entries()) {
+      tell(s.name + ': читаю страницу приказов ' + (i + 1) + ' из ' + want.length + (p.year ? ' (' + p.year + ' год)' : ''));
+      let r;
+      try { r = await relayFetch(p.url); } catch (e) { p.err = e.message; continue; }
+      if (!r.ok) { p.err = 'страница не открылась' + (r.status ? ' (код ' + r.status + ')' : r.error ? ': ' + r.error : ''); continue; }
+      const list = orderRows(html(r.bytes), r.url || p.url);
+      p.rows = list.length;
+      p.ok = true;
+      for (const x of list) { x.page = p.url; x.pageYear = p.year; rows.push(x); }
+    }
+    if (!want.some(p => p.ok)) throw new Error('страницы приказов не открылись: ' + want.map(p => p.err).filter(Boolean).join('; '));
+    /* какие файлы скачать: приказы за DGD_WINDOW дней (и без даты на странице этого года), которых ещё нет в папке */
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const since = new Date(today); since.setDate(since.getDate() - DGD_WINDOW);
+    const queue = [];
+    const dayOf = v => { const d = new Date(v); return isNaN(d) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate()); };
+    /* строки без даты (так публикует, например, Атырау): дата загрузки файла на сайт, без скачивания самого файла */
+    const undated = rows.filter(r => !r.date && r.files.some(f => !f.gov));
+    for (const [i, row] of undated.entries()) {
+      const f = row.files.find(x => !x.gov), key = f.url;
+      if (datedBefore.has(key)) { row.date = dayOf(datedBefore.get(key) + 'T00:00:00'); row.dateFrom = 'загружен на сайт'; continue; }
+      if (i % 10 === 0) tell(s.name + ': у приказов нет дат, узнаю даты загрузки на сайт: ' + (i + 1) + ' из ' + undated.length);
+      try {
+        const r = await relayFetch(f.url, 30000, 'HEAD');
+        const d = r.modified ? dayOf(r.modified) : null;
+        if (d) { row.date = d; row.dateFrom = 'загружен на сайт'; }
+      } catch (e) { /* дата останется пустой */ }
+    }
+    for (const row of rows) {
+      row.key = (row.files[0] && row.files[0].url) || row.page + '#' + row.text;
+      row.firstSeen = seenBefore.get(row.key) || isoDay(new Date());
+      const fresh = row.date ? row.date >= since : !seenBefore.has(row.key);
+      for (const f of row.files) {
+        if (f.gov) continue;
+        const was = savedBefore.get(f.url);
+        if (was) { try { await dir.getFileHandle(was); f.saved = was; continue; } catch (e) { /* файл удалили: скачать снова */ } }
+        if (fresh) queue.push({ row, f });
+      }
+    }
+    let got = 0;
+    for (const [i, q] of queue.entries()) {
+      tell(s.name + ': скачиваю приказ ' + (i + 1) + ' из ' + queue.length);
+      s.note = 'скачиваю ' + (i + 1) + ' из ' + queue.length;
+      showCollect();
+      let r;
+      try { r = await relayFetch(q.f.url, 180000); } catch (e) { q.f.err = e.message; continue; }
+      if (!r.ok || !r.bytes || !r.bytes.byteLength) { q.f.err = 'файл не скачался' + (r.status ? ' (код ' + r.status + ')' : ''); continue; }
+      const bytes = new Uint8Array(r.bytes);
+      if (/text\/html/i.test(r.type || '') && !/^%PDF/.test(latin1(bytes.subarray(0, 5)))) { q.f.err = 'вместо файла страница сайта'; continue; }
+      const name = orderFileName(q.row, q.f, r.type);
+      try { await writeFile(dir, name, bytes); } catch (e) { q.f.err = 'не записан: ' + e.message; continue; }
+      q.f.saved = name;
+      q.f.fresh = true;
+      got++;
+      queueOcr(regionFolder(s.name) + '/' + name, bytes, name);
+      await sleep(200);
+    }
+    const meta = {
+      version: VERSION, region: s.name, host: s.host, state: 'ok', note: '', collectedAt: new Date().toISOString(), window: DGD_WINDOW,
+      pages: pages.map(p => ({ url: p.url, title: p.title, year: p.year || null, rows: p.rows || 0, read: !!p.ok, err: p.err || '' })),
+      rows: rows.map(r => ({ key: r.key, date: isoDay(r.date), dateFrom: r.dateFrom || '', kind: r.kind, debtor: r.debtor, manager: r.manager, number: r.number, text: r.text,
+        page: r.page, future: r.future || false, firstSeen: r.firstSeen,
+        files: r.files.map(f => ({ url: f.url, name: f.name, gov: f.gov || false, saved: f.saved || '', err: f.err || '' })) })),
+    };
+    await writeJsonFile(dir, DGD_META, meta);
+    const win = rows.filter(r => r.date && r.date >= since).length;
+    s.note = 'приказов за ' + DGD_WINDOW + ' дн. ' + win + ', новых файлов ' + got + (queue.length > got ? ', не скачано ' + (queue.length - got) : '');
+    const left = collect ? collect.sites.filter(x => x.state === 'wait').length : 0;
+    tell(s.name + ': готово (' + s.note + ').' + (left ? ' Сейчас откроется следующий регион, там снова нажмите закладку Tazalau (осталось ' + left + ').' : ' Это был последний регион: вкладку можно закрыть.'));
+  }
+  function orderFileName(row, f, type) {
+    const ext = (/\.([a-z0-9]{2,4})$/i.exec(f.name) || [])[1] || (/pdf/i.test(type) ? 'pdf' : /png/i.test(type) ? 'png' : 'jpg');
+    const base = (isoDay(row.date) || 'без-даты') + '_' + (safeName(row.debtor).slice(0, 40) || 'приказ') + '_' + safeName(f.name.replace(/\.[a-z0-9]{2,4}$/i, '')).slice(0, 40);
+    return clean(base).replace(/\s+/g, ' ') + '.' + ext.toLowerCase();
+  }
+  /* ИИН из скачанных файлов читаются по очереди, пока скачиваются следующие */
+  function queueOcr(key, bytes, name) {
+    const c = collect;
+    c.ocrLeft++;
+    c.ocr = c.ocr.then(async () => {
+      try {
+        if (!c.cache) c.cache = (await readJsonFile(await store.dir.getDirectoryHandle(DGD_DIR, { create: true }), DGD_OCR)) || {};
+        const r = await readScan(bytes, name);
+        c.cache[key] = { size: bytes.length, at: new Date().toISOString(), note: r.note || '', iins: r.iins.map(x => ({ iin: x.iin, conf: x.conf, how: x.how, fixes: x.fixes || 0 })) };
+      } catch (e) { c.cache[key] = { size: bytes.length, at: new Date().toISOString(), note: (e && e.message) || String(e), iins: [] }; }
+      c.ocrLeft--;
+      showCollect();
+    });
+  }
+  async function finishCollect(reason) {
+    const c = collect;
+    if (!c || c.finishing) return;
+    c.finishing = true;
+    clearInterval(c.watch);
+    for (const p of c.pending.values()) p({ ok: false, status: 0, error: 'сбор остановлен' });
+    c.pending.clear();
+    try { if (!c.popup.closed) c.popup.close(); } catch (e) { /* уже закрыто */ }
+    for (const s of c.sites) if (s.state === 'open' || s.state === 'wait') { s.state = 'skip'; s.note = 'не собран' + (reason ? ' (' + reason + ')' : ''); }
+    showCollect();
+    say('ДГД: дочитываю ИИН из скачанных приказов…');
+    await c.ocr;
+    try { if (c.cache) await writeJsonFile(await store.dir.getDirectoryHandle(DGD_DIR, { create: true }), DGD_OCR, c.cache); } catch (e) { /* перечитается */ }
+    collect = null;
+    await loadDgd();
+    const wrote = await writeDgd(true);
+    const ok = c.sites.filter(s => s.state === 'done').length;
+    const lines = c.sites.map(s => ({ done: '✔ ', fail: '❌ ', skip: '⏭ ' }[s.state] || '· ') + s.name + (s.note ? ': ' + s.note : ''));
+    showCollect('Сбор ДГД ' + ruDate(new Date()) + ': регионов собрано ' + ok + ' из ' + c.sites.length + (reason ? ' (' + reason + ')' : '') + '\n' + lines.join('\n'));
+    say((ok === c.sites.length ? '✔ ' : '⚠ ') + 'ДГД собраны: ' + ok + ' из ' + c.sites.length + ' регионов. ' +
+      (wrote ? 'Свод: ' + DGD_FILE + '. ' : '') + 'Проверка регионов ниже, в блоке «ДГД».' + (S ? ' Дальше: кнопка «Старт».' : ''));
+    updateButtons();
+  }
+
   function eta(pages) {
     const sec = Math.round(pages * Math.max(1000, interval) / 1000);
     return sec < 60 ? 'меньше минуты' : sec < 5400 ? Math.round(sec / 60) + ' мин' : Math.floor(sec / 3600) + ' ч ' + pad2(Math.round(sec % 3600 / 60)) + ' мин';
   }
   function updateButtons() {
-    startB.disabled = running || !S;
+    startB.disabled = running || !S || !!collect;
+    collectB.disabled = running;
     stopB.disabled = !running;
     folderB.disabled = fileInput.disabled = fileSelect.disabled = sheetSelect.disabled = running;
     for (const b of regChecks.values()) b.disabled = running;
@@ -1705,6 +2763,8 @@
     stopping = true;
     running = false;
     if (pendingAsk) pendingAsk('Отмена');
+    if (collect) { clearInterval(collect.watch); try { collect.popup.close(); } catch (e) { /* уже закрыто */ } collect = null; }
+    window.removeEventListener('message', onRelay);
     root.remove();
     document.documentElement.style.overflow = overflowBefore;
     delete window.__tazalau;
@@ -2492,8 +3552,13 @@
       useDir, openBytes, run, timings, normBase, baseValid, folderRoom, go, buildSvg, drawSvg,
       setRegs: keys => { for (const [k, box] of regChecks) box.checked = keys.includes(k); refresh(); },
       describe, recordInfo, readRecords, makeXlsx, parseCsv, decodeText, pdfLines, fileRows, extractIins, regionsIn, readDgd, dgdWorkbook,
+      readScan, ocrIins, grayOf, ocrPlausible, orderPages, orderRows, orderInfo, samePerson, KGD_SITES,
+      collecting: () => collect && { sites: collect.sites.map(x => ({ key: x.key, name: x.name, state: x.state, note: x.note })), ocrLeft: collect.ocrLeft, finishing: !!collect.finishing },
+      relayFetch: url => relayFetch(url, 15000),
+      debugPage: async (bytes, name) => { if (/\.pdf$/i.test(name)) { const doc = await pdfOpen(bytes); return pdfPageImage(doc, doc.pages[0], OCR_DPI); } return imageFileCanvas(bytes, 'image/jpeg'); },
       state: () => ({ running, journal, tasks: tasks.length, sheet: S && S.sheet.name, layout: S && S.layout, base: baseState().base, baseAuto,
-        dgd: dgd === 'reading' ? 'reading' : dgd && { files: dgd.files.length, iins: dgd.byIin.size, regions: dgd.regions.map(r => ({ name: r.name, level: r.level, text: r.text, unique: r.unique })) } }) },
+        dgd: dgd === 'reading' ? 'reading' : dgd && { files: dgd.files.length, iins: dgd.byIin.size, orders: (dgd.orders || []).length,
+          regions: dgd.regions.map(r => ({ name: r.name, level: r.level, text: r.text, unique: r.unique, win: r.win, year: r.year, read: r.read, unread: r.unread })) } }) },
   };
   layoutFrame();
   lastRequest = Date.now();           /* первая страница в рамке тоже запрос: следующий пойдёт не раньше, чем через паузу */

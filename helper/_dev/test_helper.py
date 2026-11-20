@@ -165,6 +165,8 @@ class Site:
             return route.continue_()
         if url.hostname == "example.org":
             return route.fulfill(body="<!doctype html><title>other</title><p>other site</p>", headers={"content-type": "text/html"})
+        if url.hostname and url.hostname.endswith(".kgd.gov.kz") and getattr(self, "kgd", None):
+            return self.kgd.handle(route, request)
         if url.hostname != "tazalau.qoldau.kz":
             return route.abort()                                   # наружу не выходит ничего
         if url.path == "/icons/style.css":                         # значковый шрифт описан так же, как на настоящем сайте
@@ -197,6 +199,101 @@ class Site:
             return route.fulfill(status=500, headers={"content-type": "text/html; charset=utf-8"},
                                  body="<!doctype html><title>500</title><h1>Internal Server Error</h1>")
         return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page(url.path, param, iin))
+
+
+TNR = next((f for f in ["/System/Library/Fonts/Supplemental/Times New Roman.ttf", r"C:\Windows\Fonts\times.ttf",
+                         "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"] if Path(f).exists()), None)
+
+
+def order_scan(iin, fio, kind="pdf", dpi=200, blank=False):
+    """Скан приказа ДГД с ИИН (картинка страницы A4, как с настоящего сканера): PDF с JPEG внутри или сам JPEG."""
+    from PIL import ImageDraw, ImageFont, ImageFilter
+    w, h = int(8.27 * dpi), int(11.69 * dpi)
+    img = Image.new("L", (w, h), 246)
+    if not blank:
+        d = ImageDraw.Draw(img)
+        k = dpi / 72
+        big, body = ImageFont.truetype(TNR, int(14 * k)), ImageFont.truetype(TNR, int(14 * k))
+        d.text((int(0.9 * dpi), int(1.0 * dpi)), "ПРИКАЗ № 123", font=big, fill=20)
+        d.text((int(0.9 * dpi), int(2.0 * dpi)), "О назначении финансового управляющего", font=body, fill=25)
+        d.text((int(1.2 * dpi), int(3.0 * dpi)), f"1. Назначить финансовым управляющим Тестова Т.Т. в отношении", font=body, fill=25)
+        d.text((int(0.9 * dpi), int(3.35 * dpi)), f"гражданина {fio}, ИИН {iin}, проживающего в г. Тестовск.", font=body, fill=25)
+        d.text((int(1.2 * dpi), int(4.2 * dpi)), "2. Контроль за исполнением приказа оставляю за собой.", font=body, fill=25)
+        img = img.filter(ImageFilter.GaussianBlur(0.6))
+    buf = io.BytesIO()
+    if kind == "jpg":
+        img.save(buf, "JPEG", quality=80, dpi=(dpi, dpi))
+    else:
+        img.convert("RGB").save(buf, "PDF", resolution=dpi)
+    return buf.getvalue()
+
+
+class KgdSite:
+    """Макет сайтов ДГД 20 регионов (один Drupal): меню «Физическим лицам», страницы приказов в разных видах,
+    как на настоящих сайтах (сверено с копиями страниц 2024–2025 гг.), файлы-сканы. Имена и ИИН выдуманы."""
+    HOSTS = ["abai", "akm", "akb", "alm", "atr", "vko", "zhmb", "zhts", "zko", "krg", "kst", "kzl", "mng", "pvl", "sko", "trk", "ult",
+             "astana", "almaty", "shymkent"]
+
+    def __init__(self, today):
+        self.today = today
+        self.down = set()                  # сайты, которые не отвечают
+        self.no_page = set()               # в меню нет страницы приказов
+        self.calls = []                    # (метод, хост, путь)
+        self.files = {}                    # (хост, путь) -> (байты, тип, дата загрузки)
+        self.rows = {}                     # хост -> [строки таблицы: (ячейки html, [пути файлов])]
+        self.slug = {}
+        self.iins = {}                     # хост -> [(ИИН, ФИО)] по порядку приказов
+
+    def day(self, n):
+        return (self.today - datetime.timedelta(days=n)).strftime("%d.%m.%Y")
+
+    def add_file(self, host, path, data, ctype, ago):
+        self.files[(host, path)] = (data, ctype, self.today - datetime.timedelta(days=ago))
+
+    def menu(self, host):
+        slug = self.slug.get(host, f"prikazy-o-naznacheniiotstranenii-osvobozhdenii-finansovogo-upravlyayushchego-{host}")
+        y = self.today.year
+        items = [f'<li><a href="/ru/depsection/fizicheskim-licam">Физическим лицам</a><ul>',
+                 f'<li><a href="/ru/content/{y - 1}-god-{host}">{y - 1} год. Восстановление платежеспособности и банкротство граждан</a><ul>',
+                 (f'<li><a href="/ru/content/{slug}-old">Приказы о назначении/отстранении (освобождении) финансового управляющего</a></li>'
+                  if host not in self.no_page else '') + '</ul></li>',
+                 f'<li><a href="/ru/content/{y}-god-{host}">{y} год. Восстановление платежеспособности и банкротство граждан</a><ul>']
+        if host not in self.no_page:
+            title = ("Приказы о назначении и отстранении реабилитационных, банкротных управляющих" if host == "kst"
+                     else "Приказы о назначении/отстранении (освобождении) финансового управляющего")
+            items.append(f'<li><a href="/ru/content/{slug}">{title}</a></li>')
+        items.append('<li><a href="/ru/content/reestry-trebovaniy">Реестры требований кредиторов</a></li></ul></li></ul></li>'
+                     '<li><a href="/ru/depsection/reabilitaciya">Реабилитация и банкротство</a><ul><li><a href="/ru/content/prikazy-reabil">'
+                     'Приказы о назначении/отстранении (освобождении) реабилитационного и банкротного управляющих</a></li></ul></li>')
+        return '<ul class="menu sm">' + "".join(items) + "</ul>"
+
+    def page(self, host, body):
+        return (f'<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>ДГД {host}</title></head>'
+                f'<body class="html not-front domain-{host}-kgd-gov-kz"><div id="sidebar">{self.menu(host)}</div>'
+                f'<div id="content"><div class="node"><div class="field field-name-body"><div class="field-items"><div class="field-item">'
+                f'{body}</div></div></div></div></div></body></html>')
+
+    def table(self, host):
+        trs = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>" for cells, _ in self.rows.get(host, []))
+        return f"<table><tbody><tr><td>Наименование</td><td>ФИО</td><td>Дата</td></tr>{trs}</tbody></table>"
+
+    def handle(self, route, request):
+        url = urllib.parse.urlsplit(request.url)
+        host = url.hostname.split(".")[0]
+        self.calls.append((request.method, host, url.path))
+        if host in self.down:
+            return route.abort("timedout")
+        path = urllib.parse.unquote(url.path)
+        if (host, path) in self.files:
+            data, ctype, when = self.files[(host, path)]
+            stamp = when.strftime("%a, %d %b %Y 10:00:00 GMT")
+            return route.fulfill(status=200, headers={"content-type": ctype, "last-modified": stamp}, body=b"" if request.method == "HEAD" else data)
+        slug = self.slug.get(host, f"prikazy-o-naznacheniiotstranenii-osvobozhdenii-finansovogo-upravlyayushchego-{host}")
+        if path == f"/ru/content/{slug}":
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page(host, self.table(host)))
+        if path.startswith("/ru/"):
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page(host, "<p>Раздел</p>"))
+        return route.fulfill(status=404, headers={"content-type": "text/html"}, body="<h1>404</h1>")
 
 
 def make_book(rows, title="восстановление", extra=None):
@@ -314,7 +411,7 @@ def with_abs_path(data, folder_url):
 
 
 def run_and_wait(page, timeout=90000):
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function(DONE, timeout=timeout)
     return page.evaluate(STATE)
 
@@ -458,12 +555,12 @@ with sync_playwright() as p:
 
     # повторный запуск: новых ИИН нет, помощник спрашивает
     calls_before = len(site.calls)
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /ссылка уже записана/.test(document.body.innerText)")
     page.get_by_text("Отмена").click()
     page.wait_for_timeout(300)
     expect("повтор: без подтверждения сайт не запрашивается", len(site.calls) == calls_before)
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /ссылка уже записана/.test(document.body.innerText)")
     page.get_by_text("Все заново").click()
     page.wait_for_function(DONE)
@@ -632,7 +729,7 @@ with sync_playwright() as p:
     note = page.inner_text("#tazalau-base-state")
     expect("hyperlink: пути нет: помощник сообщает, что столбец не заполняется", page.input_value("#tazalau-base") == ""
            and "сейчас не заполняется" in note, note)
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /Путь к папке на диске не указан/.test(document.body.innerText)")
     page.get_by_role("button", name="Указать путь").click()
     page.wait_for_timeout(300)
@@ -696,7 +793,7 @@ with sync_playwright() as p:
     use_folder(page, "unc", "\\\\fileserver\\share\\Общая папка\\другая")
     note = page.inner_text("#tazalau-base-state")
     expect("hyperlink: путь кончается не той папкой: предупреждение", "Путь кончается папкой «другая», а выбрана папка «unc»" in note, note)
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /Если это разные папки/.test(document.body.innerText)")
     page.get_by_role("button", name="Исправить путь").click()
     page.wait_for_timeout(300)
@@ -707,7 +804,7 @@ with sync_playwright() as p:
     expect("hyperlink: сетевой путь", ws["D2"].value == r'=HYPERLINK("\\fileserver\share\Общая папка\unc\Сидоров Сидор\снимок.png")', ws["D2"].value)
     opfs_put(page, "iin.xlsx", original, "other")
     use_folder(page, "other", r"W:\Отдел\не та")
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /Если это разные папки/.test(document.body.innerText)")
     page.get_by_role("button", name="Записать так").click()
     page.wait_for_function(DONE)
@@ -719,7 +816,7 @@ with sync_playwright() as p:
     original = template([("Сидоров Сидор", A), ("Кузнецова Анна", int(C))], heads=("FIO", "ИИН/БИН"))
     opfs_put(page, "iin.xlsx", original, "decline")
     use_folder(page, "decline", "")
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /Путь к папке на диске не указан/.test(document.body.innerText)")
     page.get_by_role("button", name="Без hyperlink").click()
     page.wait_for_function(DONE)
@@ -730,7 +827,7 @@ with sync_playwright() as p:
            and ws["C2"].hyperlink.target == "Сидоров%20Сидор/снимок.png" and tree.get(SAVED, b"").decode("utf-8").strip() == "нет",
            (heads_of(ws), tree.get(SAVED)))
     use_folder(page, "decline", "keep")
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /ссылка уже записана/.test(document.body.innerText)")
     expect("hyperlink: ответ «без hyperlink» запомнен, второй раз о пути не спрашивают", "Путь к папке на диске не указан" not in page.inner_text("body"))
     page.get_by_role("button", name="Отмена").click()
@@ -764,7 +861,7 @@ with sync_playwright() as p:
            and all(f + "/снимок.png" in tree for f in want), [str(ws.cell(r, 4).value)[len(LONG):] for r in range(2, 6)])
     longest = max(len(path_of(ws.cell(r, 4)) or "") for r in range(2, 6))
     expect("длинный путь: полный путь к снимку с запасом короче 259 знаков", longest <= 259 - 7 - 3 and all(len(f) <= room for f in want), longest)
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /ссылка уже записана/.test(document.body.innerText)")
     page.get_by_text("Все заново").click()
     page.wait_for_function(DONE)
@@ -785,7 +882,7 @@ with sync_playwright() as p:
     set_base(page, "просто текст")
     note = page.inner_text("#tazalau-base-state")
     expect("путь к папке: не путь Windows", "Это не путь Windows" in note, note)
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => /останется пустым/.test(document.body.innerText)")
     expect("путь к папке: при неверном пути помощник спрашивает перед запуском", not site.calls
            and "Это не путь Windows" in page.inner_text("body"), site.calls)
@@ -952,6 +1049,14 @@ with sync_playwright() as p:
     page.set_input_files("input[type=file]", files=[{"name": "выгрузка.csv", "mimeType": "text/csv", "buffer": adw}])
     page.wait_for_function("() => window.__tazalau.test.state().tasks === 2")
     expect("CSV: и в режиме «один файл»", "выгрузка.xlsx" in page.inner_text("body"))
+    sample = (ROOT / "sql" / "ADW_пример_выгрузки.csv").read_bytes()
+    opfs_put(page, "ADW_пример_выгрузки.csv", sample, "sample")
+    use_folder(page, "sample")
+    page.wait_for_function("() => window.__tazalau.test.state().tasks === 6")
+    ws = load_workbook(io.BytesIO(opfs_tree(page, "sample")["ADW_пример_выгрузки.xlsx"]))["Лист1"]
+    body = page.inner_text("body")
+    expect("пример выгрузки ADW (sql/ADW_пример_выгрузки.csv): 6 строк, 5 ИИН, ведущий ноль цел, опечатка показана",
+           ws["A5"].value == "001316000001" and "К проверке: 4 ИИН (строк 5)" in body and "Строк с неверным ИИН: 1" in body, body[:600])
     expect("CSV: страница без ошибок", not page.errors, page.errors[:3])
     page.close()
 
@@ -1056,11 +1161,11 @@ with sync_playwright() as p:
            [ws.cell(r, 7).value for r in range(2, 6)])
     summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
     reg, iins, files = summary["Регионы"], summary["ИИН"], summary["Файлы"]
-    rows = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 10)] for r in range(2, reg.max_row + 1)}
-    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом", summary.sheetnames == ["Регионы", "ИИН", "Файлы"] and len(rows) == 21
+    rows = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 15)] for r in range(2, reg.max_row + 1)}
+    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом", summary.sheetnames == ["Регионы", "Приказы", "ИИН", "Файлы"] and len(rows) == 21
            and rows["Акмолинская обл."][1] == "нет списка" and reg.cell(list(rows).index("Акмолинская обл.") + 2, 2).fill.fgColor.rgb.endswith("FFC7CE")
            and rows["Павлодарская обл."][1] == "в порядке" and reg.cell(list(rows).index("Павлодарская обл.") + 2, 2).fill.fgColor.rgb.endswith("C6EFCE")
-           and rows["Павлодарская обл."][6] == d0, rows.get("Павлодарская обл."))
+           and rows["Павлодарская обл."][2] == "нет" and rows["Павлодарская обл."][11] == d0, rows.get("Павлодарская обл."))
     got = {iins.cell(r, 1).value: [iins.cell(r, c).value for c in range(1, 9)] for r in range(2, iins.max_row + 1)}
     expect("ДГД свод: лист «ИИН»: ИИН текстом (ведущий ноль цел), ФИО, регион, управляющий, файл со ссылкой",
            got[C1][:5] == [C1, "Нулев Ноль", "г. Алматы", d0, "Петров Пётр Петрович"] and got[P1][1] == "Иванов Иван Иванович"
@@ -1105,6 +1210,203 @@ with sync_playwright() as p:
     expect("PDF: простой шрифт без таблицы символов и ИИН группами по 4 цифры", probe["simple"] == [P1, P2], probe)
     expect("PDF: скан без текста распознан как скан", "скан" in probe["note"], probe)
     page.close()
+
+    # ---------- 3з. ДГД: сбор приказов с сайтов 20 регионов (окно сайта + закладка в нём) ----------
+    if TNR:
+        now = datetime.datetime.now()
+        kgd = KgdSite(now)
+        site.kgd = kgd
+        seq = iter(range(100, 999))
+        made = {}                                                     # ИИН -> (хост, ФИО)
+
+        def person(host, fio, ago, style="kzl", kind="pdf", readable=True, text_layer=False):
+            n = next(seq)
+            born = now - datetime.timedelta(days=365 * (30 + n % 25) + n)
+            iin = plausible(born.strftime("%y%m%d") + str(3 + n % 2))
+            fname = f"/sites/default/files/u{n}/prikaz_{n}.{'jpg' if kind == 'jpg' else 'pdf'}"
+            if text_layer:
+                buf = io.BytesIO(); cv = rl_canvas.Canvas(buf); cv.setFont("Helvetica", 12)
+                cv.drawString(72, 760, f"Order {n}: IIN {iin}"); cv.save(); data = buf.getvalue()
+            else:
+                data = order_scan(iin, fio, kind, blank=not readable)
+            kgd.add_file(host, fname, data, "image/jpeg" if kind == "jpg" else "application/pdf", ago)
+            link = f'<a href="https://{host}.kgd.gov.kz{fname}">'
+            if style == "kzl":
+                cells = [f"{link}Приказ о назначении финансовым управляющим Тестов Т.Т. в отношении ФЛ {fio} от {kgd.day(ago)} г.</a>"]
+            elif style == "almaty":
+                cells = [f"{link}Приказ о назначении финансового управляющего по заявлению должника {fio}</a>", "Сидорова Анна Сергеевна", kgd.day(ago)]
+            elif style == "atr":
+                cells = [f"{link}{fio}</a>", str(n)]
+            else:
+                cells = [f"{link}{fio}</a>", kgd.day(ago)]
+            kgd.rows.setdefault(host, []).append((cells, [fname]))
+            if readable:
+                made[iin] = (host, fio)
+            return iin
+
+        K1, K2, K3 = (person("kzl", f, a) for f, a in [("Кызылова Кайрата Ивановича", 1), ("Сейтовой Алмы Ериковны", 2), ("Жумабаева Нурлана", 3)])
+        person("kzl", "Старова Олега Петровича", 40)
+        A1, A2 = person("almaty", "Ахметова Айгерима", 1, "almaty", "jpg"), person("almaty", "Борисовой Веры", 2, "almaty", "jpg")
+        person("almaty", "Нечитаемовой Нины Николаевны", 3, "almaty", "jpg", readable=False)
+        kgd.rows["almaty"].append((['<a href="https://www.gov.kz/memleket/entities/kgd-almaty/documents/details/123">Приказ о назначении финансового '
+                                    'управляющего по заявлению должника Гостевой Галины</a>', "Сидорова Анна Сергеевна", kgd.day(4)], []))
+        for f, a in [("Атыраев Арман Нурланович", 1), ("Бекова Дана Маратовна", 2), ("Сагиев Ерлан Кайратович", 3), ("Давний Дмитрий Иванович", 90)]:
+            person("atr", f, a, "atr")
+        kgd.slug["kst"] = "prikazy-o-naznachenii-i-otstranenii-finansovyh-upravlyayushchih-12"
+        for f, a in [("Костин К.К.", 1), ("Лаврова Л.Л.", 4), ("Маратов М.М.", 6)]:
+            person("kst", f, a, "plain")
+        person("abai", "Абаев А.А.", 2, "plain")
+        for f, a in [("Старый С.С.", 60), ("Старая С.С.", 70)]:
+            person("akm", f, a, "plain")
+        for f, a in [("Павлов П.П.", 20), ("Павлова П.П.", 25)]:
+            person("pvl", f, a, "plain")
+        V1 = person("vko", "Восточный В.В.", 1, "plain", text_layer=True)
+        for f, a in [("Восточная В.В.", 2), ("Восточнов В.В.", 3)]:
+            person("vko", f, a, "plain")
+        kgd.down.add("mng")
+        kgd.no_page.add("zko")
+        for host in ["akb", "alm", "zhmb", "zhts", "krg", "sko", "trk", "ult", "astana", "shymkent"]:
+            for i in range(3):
+                person(host, f"Тестов{host.capitalize()} Т{i}.Т.", 1 + i, "plain")
+        N1, X1 = plausible("8801014"), plausible("7702023")
+        work = fio_book("FIO", [("ПОСТОРОННИЙ ПЁТР ПЕТРОВИЧ", X1), ("НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА", N1), ("КЫЗЫЛОВ КАЙРАТ ИВАНОВИЧ", K1)])
+        site.calls.clear()
+        site.found = {}
+        page = open_helper(ctx, site, {"width": 1366, "height": 900})
+        opfs_put(page, "ADW.xlsx", work, "kgd")
+        use_folder(page, "kgd")
+        page.wait_for_function("() => { const d = window.__tazalau.test.state().dgd; return d !== 'reading'; }", timeout=30000)
+        expect("сбор ДГД: кнопка видна, пока в папке нет ДГД", page.get_by_role("button", name="🌐 Собрать ДГД с сайтов").is_visible())
+
+        def collect_all(stop_after=None):
+            with page.expect_popup() as info:
+                page.get_by_role("button", name="🌐 Собрать ДГД с сайтов").click()
+            popup = info.value
+            done = []
+            for _ in range(60):
+                st = page.evaluate("() => window.__tazalau.test.collecting()")
+                if not st or st["finishing"]:
+                    break
+                cur = next((x for x in st["sites"] if x["state"] in ("open", "work")), None)
+                if not cur:
+                    break
+                host = cur["key"]
+                if stop_after is not None and len(done) >= stop_after:
+                    page.get_by_role("button", name="Закончить сбор").click()
+                    break
+                if cur["state"] == "open":
+                    if host in kgd.down:
+                        page.wait_for_timeout(300)
+                        page.get_by_role("button", name="Пропустить регион").click()
+                        done.append(host)
+                        continue
+                    popup.wait_for_url(f"https://{host}.kgd.gov.kz/**", timeout=20000)
+                    popup.wait_for_load_state("domcontentloaded")
+                    ctx.new_cdp_session(popup).send("Page.navigate", {"url": HREF})        # закладка в окне сайта
+                page.wait_for_function("""key => { const c = window.__tazalau.test.collecting(); if (!c) return true;
+                    const s = c.sites.find(x => x.key === key); return s.state !== 'open' && s.state !== 'work'; }""", arg=host, timeout=90000)
+                done.append(host)
+            page.wait_for_function("() => !window.__tazalau.test.collecting() && /ДГД собраны/.test(document.querySelector('#tazalau-state').textContent)",
+                                   timeout=180000)
+            return done
+
+        done = collect_all()
+        said = page.evaluate(STATE)
+        expect("сбор ДГД: пройдены все 20 сайтов по очереди, итог в окне", len(done) == 20 and "ДГД собраны: 18 из 20" in said, (done, said))
+        tree = opfs_tree(page, "kgd")
+        kz = [k for k in tree if k.startswith("ДГД/Кызылординская область/") and not k.endswith(".json")]
+        expect("сбор ДГД: скачаны только приказы за 31 день (Кызылорда: 3 из 4), в папку региона", len(kz) == 3
+               and "ДГД/Кызылординская область/приказы_с_сайта.json" in tree, sorted(kz))
+        al = [k for k in tree if k.startswith("ДГД/г. Алматы/") and not k.endswith(".json")]
+        expect("сбор ДГД: JPEG-сканы скачаны, ссылка на gov.kz не скачивается", len(al) == 3 and all(k.endswith(".jpg") for k in al), al)
+        at = [k for k in tree if k.startswith("ДГД/Атырауская область/") and not k.endswith(".json")]
+        expect("сбор ДГД: строки без даты: дата загрузки файла на сайт (Атырау: 3 свежих из 4)", len(at) == 3, at)
+        heads = [c for c in kgd.calls if c[0] == "HEAD"]
+        expect("сбор ДГД: для строк без даты сначала запрос даты (HEAD), без скачивания", len(heads) == 4 and all(c[1] == "atr" for c in heads), heads)
+        expect("сбор ДГД: распознанные ИИН запомнены в ДГД/распознано.json", "ДГД/распознано.json" in tree
+               and K1 in tree["ДГД/распознано.json"].decode("utf-8"))
+        regions = {r["name"]: r for r in page.evaluate("() => window.__tazalau.test.state().dgd.regions")}
+        want = {"Кызылординская обл.": ("good", "в порядке"), "Костанайская обл.": ("good", "в порядке"),
+                "Атырауская обл.": ("good", "в порядке"), "Восточно-Казахстанская обл.": ("good", "в порядке"),
+                "г. Алматы": ("warn", "ИИН не прочитан в приказах: 1"), "Абайская обл.": ("warn", "всего 1 приказ за 31 дн."),
+                "Акмолинская обл.": ("bad", "0 приказов за 31 дн."), "Павлодарская обл.": ("warn", "всего 2 приказа за 31 дн."),
+                "Мангистауская обл.": ("bad", "сайт не открылся"), "Западно-Казахстанская обл.": ("bad", "в меню сайта нет страницы")}
+        for name, (level, text) in want.items():
+            r = regions[name]
+            expect(f"сбор ДГД: проверка региона: {name}: {text}", r["level"] == level and text in r["text"], r)
+        expect("сбор ДГД: свежесть: последний приказ 20 дн. назад отмечен", "последний приказ " + kgd.day(20) + ": 20 дн. назад" in regions["Павлодарская обл."]["text"],
+               regions["Павлодарская обл."])
+        expect("сбор ДГД: приказ на gov.kz отмечен для ручной загрузки", "приказы на gov.kz: 1" in regions["г. Алматы"]["text"], regions["г. Алматы"])
+        expect("сбор ДГД: Костанай найден по адресу страницы, хотя пункт меню назван иначе", regions["Костанайская обл."]["win"] == 3, regions["Костанайская обл."])
+        dg = page.evaluate("() => window.__tazalau.test.state().dgd")
+        read = {i for i in made}
+        expect("сбор ДГД: ИИН прочитаны со сканов PDF и JPEG и из текста PDF: все читаемые за 31 день", dg["iins"] >= 40, dg)
+        summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
+        orders = summary["Приказы"]
+        got = {}
+        for r in range(2, orders.max_row + 1):
+            for iin in str(orders.cell(r, 6).value or "").split(", "):
+                got[iin] = [orders.cell(r, c).value for c in range(1, 11)] + [orders.cell(r, 8).hyperlink]
+        expect("сбор ДГД: свод, лист «Приказы»: регион, дата, вид, должник, управляющий, ИИН, как прочитан, файл со ссылкой",
+               got.get(K1, [None])[0] == "Кызылординская обл." and got[K1][1] == kgd.day(1) and got[K1][2] == "назначение"
+               and got[K1][3] == "Кызылова Кайрата Ивановича" and got[K1][4] == "Тестов Т.Т." and got[K1][6] == "распознано со скана"
+               and got[K1][10] is not None and got.get(V1, [None] * 7)[6] == "текст PDF" and got.get(A1, [None])[0] == "г. Алматы", got.get(K1))
+        wrong = [i for i in got if i and i.isdigit() and i not in made]
+        expect("сбор ДГД: ни одного чужого ИИН (только те, что в приказах)", not wrong, wrong)
+        missed = [i for i in made if i not in got and kgd.files]
+        old_ok = {i for i, (h, f) in made.items() if h in ("akm", "pvl") or f in ("Старова Олега Петровича", "Давний Дмитрий Иванович")}
+        expect("сбор ДГД: все читаемые приказы за 31 день прочитаны", not [i for i in missed if i not in old_ok], [made[i] for i in missed if i not in old_ok])
+        reg = summary["Регионы"]
+        row = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 15)] for r in range(2, reg.max_row + 1)}
+        expect("сбор ДГД: свод, лист «Регионы»: сбор, последний приказ, приказов за 31 день, прочитано, страница на сайте",
+               row["Кызылординская обл."][2] == now.strftime("%d.%m.%Y") and row["Кызылординская обл."][3] == kgd.day(1)
+               and row["Кызылординская обл."][4] == "3" and row["Кызылординская обл."][6] == "3" and "kzl.kgd.gov.kz/ru/content/" in str(row["Кызылординская обл."][12])
+               and str(row["Мангистауская обл."][2]).startswith("не открылся"), row["Кызылординская обл."])
+        final = run_and_wait(page)
+        tree = opfs_tree(page, "kgd")
+        expect("сбор ДГД: ИИН из приказов ДГД проверяются на tazalau первыми", [c[1] for c in site.calls][:1] == [K1], site.calls[:3])
+        ws = load_workbook(io.BytesIO(tree["ADW.xlsx"]))["ИИН"]
+        col = [ws.cell(1, c).value for c in range(1, 12)].index("ДГД") + 1
+        vals = {ws.cell(r, 2).value: (ws.cell(r, col).value, ws.cell(r, col).hyperlink) for r in range(2, 5)}
+        expect("сбор ДГД: в рабочем файле столбец «ДГД»: регион, приказ, дата, управляющий, ссылка на скан",
+               str(vals[K1][0]).startswith(f"Кызылординская обл., приказ о назначении от {kgd.day(1)}, управляющий: Тестов Т.Т.") and vals[K1][1] is not None
+               and vals[X1][0] in (None, ""), vals)
+        expect("сбор ДГД: приказ без прочитанного ИИН сверен по ФИО: «возможно» со ссылкой на скан",
+               str(vals[N1][0]).startswith("⚠ возможно (по ФИО, ИИН в приказе не прочитан): г. Алматы, «Нечитаемовой Нины Николаевны»") and vals[N1][1] is not None,
+               vals[N1])
+        # связной: чужие адреса не скачивает; без помощника только подсказывает
+        before = len([c for c in kgd.calls if c[2].startswith("/sites/")])
+        done2 = collect_all(stop_after=1)
+        after = len([c for c in kgd.calls if c[2].startswith("/sites/")])
+        expect("сбор ДГД: повторный сбор не скачивает уже сохранённые приказы", after == before and done2[:1] == ["abai"], (before, after, done2))
+        meta = json.loads(opfs_tree(page, "kgd")["ДГД/Абайская область/приказы_с_сайта.json"].decode("utf-8"))
+        expect("сбор ДГД: дата «впервые увиден» сохраняется между сборами", meta["rows"][0]["firstSeen"] == now.strftime("%Y-%m-%d"), meta["rows"][0])
+        lone = ctx.new_page()
+        lone.goto("https://abai.kgd.gov.kz/ru/depsection/fizicheskim-licam")
+        ctx.new_cdp_session(lone).send("Page.navigate", {"url": HREF})
+        lone.wait_for_function("() => document.body.innerText.includes('Это окно открыл не помощник')", timeout=10000)
+        expect("связной: окно сайта, открытое не помощником, только объясняет, что делать", True)
+        lone.close()
+        with page.expect_popup() as info:
+            page.evaluate("() => { window.__probe = window.open('https://kzl.kgd.gov.kz/ru/depsection/fizicheskim-licam', 'probe'); }")
+        probe = info.value
+        probe.wait_for_load_state("domcontentloaded")
+        ctx.new_cdp_session(probe).send("Page.navigate", {"url": HREF})
+        probe.wait_for_function("() => !!window.__tazalauRelay")
+        answers = page.evaluate("""() => new Promise(done => {
+            const got = {};
+            const on = e => { if (e.data && e.data.tz === 'fetched') { got[e.data.id] = { ok: e.data.ok, err: e.data.error || '', size: e.data.bytes ? e.data.bytes.byteLength : 0 };
+              if (got[1] && got[2]) { window.removeEventListener('message', on); done(got); } } };
+            window.addEventListener('message', on);
+            window.__probe.postMessage({ tz: 'fetch', id: 1, url: 'https://example.org/secret' }, 'https://kzl.kgd.gov.kz');
+            window.__probe.postMessage({ tz: 'fetch', id: 2, url: '/ru/depsection/fizicheskim-licam' }, 'https://kzl.kgd.gov.kz');
+            setTimeout(() => done(got), 8000); })""")
+        expect("связной: чужой адрес не скачивает, адрес своего сайта скачивает",
+               answers.get("1", {}).get("ok") is False and "другого сайта" in answers["1"]["err"] and answers.get("2", {}).get("ok") is True
+               and answers["2"]["size"] > 100, answers)
+        probe.close()
+        expect("сбор ДГД: страница без ошибок", not page.errors, page.errors[:3])
+        page.close()
 
     # ---------- 4. несколько реестров: один снимок на ИИН ----------
     site.calls.clear()
@@ -1165,7 +1467,7 @@ with sync_playwright() as p:
     page = open_helper(ctx, site, {"width": 1366, "height": 768}, {"INTERVAL": 700})
     opfs_put(page, "стоп.xlsx", make_book([("а", A, ""), ("б", int(B), ""), ("в", int(C), ""), ("г", D, ""), ("д", E, "")]), "stop")
     use_folder(page, "stop")
-    page.get_by_text("▶ Старт").click()
+    page.get_by_role("button", name="▶ Старт").click()
     page.wait_for_function("() => window.__tazalau.test.state().journal.length >= 2")
     page.get_by_text("⏹ Стоп").click()
     page.wait_for_function(DONE)
@@ -1252,7 +1554,7 @@ with sync_playwright() as p:
     ]:
         page.set_input_files("input[type=file]", files=[{"name": name, "mimeType": "application/octet-stream", "buffer": data}])
         page.wait_for_function("needle => document.querySelector('#tazalau-state').textContent.includes(needle)", arg=needle, timeout=5000)
-        expect(f"плохой файл: {label}", needle in page.evaluate(STATE) and page.get_by_text("▶ Старт").is_disabled())
+        expect(f"плохой файл: {label}", needle in page.evaluate(STATE) and page.get_by_role("button", name="▶ Старт").is_disabled())
     page.close()
     browser.close()
 
