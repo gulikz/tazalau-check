@@ -1,0 +1,8 @@
+# Ноутбук и ежедневный запуск (пакет tazalau_daily): pip install -r requirements-daily.txt
+-r requirements.txt
+pandas>=2.0          # таблицы в ноутбуке
+pypdf>=4.0           # текст PDF (публикации ДГД)
+xlrd>=2.0            # старые таблицы .xls (так выкладывает ЗКО)
+python-docx>=1.1     # только для тестов: файл Word в макете gov.kz
+# psycopg2-binary>=2.9   # по желанию: выгрузка ADW запросом к PostgreSQL (иначе: файл ADW*.xlsx/csv)
+# jupyterlab             # если Jupyter ещё не установлен (в Anaconda он есть)
