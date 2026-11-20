@@ -286,6 +286,9 @@ class GovSite:
         path = urllib.parse.unquote(url.path)
         q = urllib.parse.parse_qs(url.query)
         self.calls.append((request.method, path))
+        if re.match(r"^/org/[a-z-]+$", path):
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"},
+                                 body="<!doctype html><html lang='ru'><head><meta charset='utf-8'><title>ДГД</title></head><body><h1>Департамент</h1></body></html>")
         m = re.match(r"^/org/([a-z-]+)/documents/(\d+)$", path)
         if m and m.group(1) in self.docs:
             slug, n = m.group(1), int(m.group(2))
@@ -1310,13 +1313,17 @@ with sync_playwright() as p:
         page.wait_for_function("() => { const d = window.__tazalau.test.state().dgd; return d !== 'reading'; }", timeout=30000)
 
         def collect_all(stop_after=None):
+            page.get_by_role("button", name="🌐 Собрать ДГД с gov.kz").click()
+            page.wait_for_function("() => /ничего не заполняйте/.test(document.body.innerText)")
             with page.expect_popup() as info:
-                page.get_by_role("button", name="🌐 Собрать ДГД с gov.kz").click()
+                page.get_by_role("button", name="Открыть gov.kz").click()
             tab = info.value
             tab.wait_for_load_state("domcontentloaded")
-            expect("сбор ДГД: вкладка gov.kz открыта, помощник просит нажать закладку", "нажмите в ней закладку" in page.inner_text("#tazalau-collect")
-                   and tab.url.startswith("https://www.gov.kz/org/"), tab.url)
+            expect("сбор ДГД: сначала объяснено, что на gov.kz ничего не заполнять, только нажать закладку; вкладка открыта на обычной странице",
+                   "ничего не заполняйте: нажмите закладку" in page.inner_text("#tazalau-collect") and page.title().startswith("👉 Нажмите закладку Tazalau")
+                   and tab.url.startswith("https://www.gov.kz/org/kgd-almaty?lang=ru#") and "/documents" not in tab.url, (tab.url, page.title()))
             ctx.new_cdp_session(tab).send("Page.navigate", {"url": HREF})        # одна закладка во вкладке gov.kz
+            tab.wait_for_function("() => /Связь с помощником есть|список документов|публикация \\d+ из|готово \\(/.test(document.body.innerText)", timeout=20000)
             if stop_after:
                 page.wait_for_function("n => { const c = window.__tazalau.test.collecting(); return !c || c.sites.filter(x => x.state === 'done').length >= n; }",
                                        arg=stop_after, timeout=120000)

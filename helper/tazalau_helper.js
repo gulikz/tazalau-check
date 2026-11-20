@@ -100,8 +100,20 @@
         opener.postMessage({ tz: 'fetched', id: m.id, ok: false, status: 0, error: String((err && err.message) || err) }, HOME);
       }
     });
+    let linked = false;
+    window.addEventListener('message', e => {
+      if (e.origin === HOME && e.source === opener && e.data && e.data.tz === 'ack' && !linked) {
+        linked = true;
+        say('Связь с помощником есть: собираю публикации ДГД всех 20 регионов. Здесь ничего делать не нужно, вкладку не закрывайте: ' +
+          'она закроется сама, когда сбор кончится.');
+      }
+    });
     opener.postMessage({ tz: 'hello', href: location.href, host: location.host, version: VERSION }, HOME);
-    say('Связь с помощником есть: собираю приказы и объявления ДГД всех 20 регионов. Вкладку не закрывайте, ход сбора виден здесь и во вкладке tazalau.');
+    say('Ищу помощник во вкладке tazalau…');
+    setTimeout(() => {
+      if (!linked) say('Помощник во вкладке tazalau не отвечает. Вернитесь во вкладку tazalau.qoldau.kz, нажмите там закладку Tazalau и кнопку ' +
+        '«Собрать ДГД с gov.kz» ещё раз.');
+    }, 6000);
   }
 
   /* ======================= НАСТРОЙКИ ======================= */
@@ -1761,7 +1773,7 @@
     ['kgd-turkistan', 'Туркестанская обл.'], ['kgd-ulytau', 'Улытауская обл.'], ['kgd-astana', 'г. Астана'],
     ['kgd-almaty', 'г. Алматы'], ['kgd-shymkent', 'г. Шымкент']];
   const GOV = 'https://www.gov.kz';
-  const GOV_START = GOV + '/org/kgd-almaty/documents/1?lang=ru';
+  const GOV_START = GOV + '/org/kgd-almaty?lang=ru#НАЖМИТЕ-ЗАКЛАДКУ-Tazalau';   /* обычная страница департамента, подсказка видна в адресной строке */
   const GOV_PAGES = 12;                   /* страниц списка документов (по 50) на регион, не больше */
   const DGD_WINDOW = 31;                  /* публикации за столько дней скачиваются и читаются */
   const DGD_SITE_STALE = 14;              /* последняя публикация региона старше стольких дней: проверить */
@@ -2575,15 +2587,21 @@
   async function writeJsonFile(dir, name, obj) { await writeFile(dir, name, new Blob([JSON.stringify(obj, null, 1)], { type: 'application/json' })); }
   const isoDay = d => (d ? d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) : '');
   const dayOf = v => { const d = new Date(v); return isNaN(d) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate()); };
-  function collectDgd() {
+  async function collectDgd() {
     if (running) return;
-    if (!store.dir) { say('Сначала выберите папку (📁 Папка с Excel): в её подпапку «' + DGD_DIR + '» помощник сложит приказы и объявления ДГД.'); return; }
+    if (!store.dir) { say('Сначала выберите папку (📁 Папка с Excel): в её подпапку «' + DGD_DIR + '» помощник сложит публикации ДГД.'); return; }
     if (collect) { try { collect.popup.focus(); } catch (e) { /* вкладка закрыта */ } return; }
+    const answer = await ask('Сейчас откроется вкладка gov.kz.\n\nТам ничего не заполняйте и не ищите. Как только страница откроется, нажмите ' +
+      'закладку «Tazalau ▶» на панели закладок, один раз.\n\nДальше помощник сам соберёт публикации ДГД всех 20 регионов, вкладка gov.kz закроется сама.',
+      ['Открыть gov.kz', 'Отмена']);
+    if (answer !== 'Открыть gov.kz' || collect || running) return;
     /* Вкладка gov.kz открывается сразу по нажатию кнопки (иначе браузер её заблокирует); это обычная вкладка с панелью закладок */
     const popup = window.open(GOV_START, 'tazalau_dgd');
     if (!popup) { say('❌ Браузер не дал открыть вкладку gov.kz. Разрешите всплывающие окна для tazalau.qoldau.kz (значок справа в адресной строке) и нажмите кнопку ещё раз.'); return; }
     const sites = GOV_SITES.map(([slug, name]) => ({ slug, key: slug, name, state: 'wait', note: '' }));
-    collect = { sites, popup, origin: '', pending: new Map(), seq: 0, cur: null, ocr: Promise.resolve(), ocrLeft: 0, cache: null, started: new Date(), connected: false };
+    collect = { sites, popup, origin: '', pending: new Map(), seq: 0, cur: null, ocr: Promise.resolve(), ocrLeft: 0, cache: null, started: new Date(),
+      connected: false, title: document.title };
+    document.title = '👉 Нажмите закладку Tazalau во вкладке gov.kz';
     collect.watch = setInterval(() => { if (collect && collect.popup && collect.popup.closed && !collect.finishing) finishCollect('вкладка gov.kz закрыта'); }, 1500);
     showCollect();
     updateButtons();
@@ -2595,7 +2613,7 @@
     if (!c && !final) { collectBox.style.display = 'none'; return; }
     collectBox.style.display = 'block';
     if (final) { collectBox.textContent = final; return; }
-    if (!c.connected) { collectBox.textContent = 'Открыта вкладка gov.kz: нажмите в ней закладку Tazalau ▶ (один раз). Дальше помощник соберёт все 20 регионов сам.'; return; }
+    if (!c.connected) { collectBox.textContent = '👉 Открыта вкладка gov.kz. В ней ничего не заполняйте: нажмите закладку «Tazalau ▶» на панели закладок (один раз). Дальше помощник соберёт все 20 регионов сам.'; return; }
     const icon = { wait: '·', work: '⏬', done: '✔', fail: '❌', skip: '⏭' };
     const lines = c.sites.map(s => icon[s.state] + ' ' + s.name + (s.note ? ': ' + s.note : ''));
     const done = c.sites.filter(s => /done|fail|skip/.test(s.state)).length;
@@ -2619,7 +2637,10 @@
     if (!c || !m || typeof m.tz !== 'string' || e.source !== c.popup) return;
     if (!/^https:\/\/(www\.)?gov\.kz$/i.test(e.origin)) return;
     if (m.tz === 'fetched') { const p = c.pending.get(m.id); if (p) { c.pending.delete(m.id); p(m); } return; }
-    if (m.tz === 'hello' && !c.connected) { c.origin = e.origin; c.connected = true; harvestAll(); }
+    if (m.tz === 'hello') {
+      try { c.popup.postMessage({ tz: 'ack' }, e.origin); } catch (x) { /* вкладка закрыта */ }
+      if (!c.connected) { c.origin = e.origin; c.connected = true; document.title = c.title; harvestAll(); }
+    }
   }
   window.addEventListener('message', onRelay);
   async function harvestAll() {
@@ -2777,6 +2798,8 @@
     for (const p of c.pending.values()) p({ ok: false, status: 0, error: 'сбор остановлен' });
     c.pending.clear();
     try { if (!c.popup.closed) c.popup.close(); } catch (e) { /* уже закрыто */ }
+    if (c.title && !c.connected) document.title = c.title;
+    try { window.focus(); } catch (e) { /* браузер не дал */ }
     for (const s of c.sites) if (s.state === 'work' || s.state === 'wait') { s.state = 'skip'; s.note = 'не собран' + (reason ? ' (' + reason + ')' : ''); }
     showCollect();
     say('ДГД: дочитываю ИИН из скачанных файлов…');
