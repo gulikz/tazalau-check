@@ -1329,6 +1329,10 @@
     for (let i = 0; i < f.length; i++) f[i] /= ss;
     return f;
   }
+  /* Образцы цифр со сканов: средний образ каждой цифры по 1356 цифрам из 104 настоящих приказов ДГД (ИИН, прочитанные
+     уверенно), сетка OCR_GW × OCR_GH, по 216 чисел от -127 до 127 на цифру. По среднему восстановить чей-то ИИН нельзя. */
+  const SCAN_DIGITS = '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';
+  const SCAN_AR = [0.607, 0.37, 0.63, 0.556, 0.643, 0.556, 0.607, 0.607, 0.556, 0.609];
   /* Образцы цифр: рисуются шрифтами Times New Roman (обычный и жирный) и Arial нужной высоты, как на скане */
   let DIGITS = null;
   function digitTemplates() {
@@ -1351,6 +1355,15 @@
           DIGITS.push({ d, px, f: featOf(G, x0, y0, x1, y1), ar: (x1 - x0 + 1) / (y1 - y0 + 1) });
         }
       }
+    }
+    const raw = Uint8Array.from(atob(SCAN_DIGITS), c => c.charCodeAt(0)), n = OCR_GW * OCR_GH;
+    for (let d = 0; d < 10; d++) {
+      const f = new Float32Array(n);
+      let ss = 0;
+      for (let i = 0; i < n; i++) { const v = raw[d * n + i]; f[i] = v > 127 ? v - 256 : v; ss += f[i] * f[i]; }
+      ss = Math.sqrt(ss) || 1;
+      for (let i = 0; i < n; i++) f[i] /= ss;
+      DIGITS.push({ d, px: 0, f, ar: SCAN_AR[d] });                                /* px 0: годится для знака любой высоты */
     }
     return DIGITS;
   }
@@ -1479,7 +1492,7 @@
       const px = OCR_SIZES.reduce((a, s) => (Math.abs(s - ch) < Math.abs(a - ch) ? s : a), OCR_SIZES[0]);
       const best = new Array(10).fill(-9);
       for (const t of T) {
-        if (t.px !== px) continue;
+        if (t.px !== px && t.px !== 0) continue;
         let s = 0;
         for (let i = 0; i < f.length; i++) s += f[i] * t.f[i];
         s -= 0.5 * Math.abs(Math.log(ar / t.ar));
@@ -1525,6 +1538,7 @@
         best.conf = best.fixes === 0 && low >= 0.45 ? 'high' : 'medium';     /* проверка на 225 приказах: «high» без единой ошибки */
         best.x = glyphs[0].x0;
         best.y = glyphs[0].y0;
+        if (dbg && dbg.learn && best.conf === 'high') dbg.learn.push(glyphs.map((c, i) => ({ d: +best.iin[i], h: c.y1 - c.y0 + 1, ar: (c.x1 - c.x0 + 1) / (c.y1 - c.y0 + 1), f: Array.from(featOf(G, c.x0, c.y0, c.x1, c.y1)) })));
         const old = found.get(best.iin);
         if (!old || old.fixes > best.fixes || (old.fixes === best.fixes && old.score < best.score)) found.set(best.iin, best);
       }
@@ -3555,6 +3569,7 @@
       readScan, ocrIins, grayOf, ocrPlausible, orderPages, orderRows, orderInfo, samePerson, KGD_SITES,
       collecting: () => collect && { sites: collect.sites.map(x => ({ key: x.key, name: x.name, state: x.state, note: x.note })), ocrLeft: collect.ocrLeft, finishing: !!collect.finishing },
       relayFetch: url => relayFetch(url, 15000),
+      learnPage: async (bytes, name) => { const c = await window.__tazalau.test.debugPage(bytes, name); const dbg = []; dbg.learn = []; if (c) ocrIins(grayOf(c), dbg); return dbg.learn; },
       debugPage: async (bytes, name) => { if (/\.pdf$/i.test(name)) { const doc = await pdfOpen(bytes); return pdfPageImage(doc, doc.pages[0], OCR_DPI); } return imageFileCanvas(bytes, 'image/jpeg'); },
       state: () => ({ running, journal, tasks: tasks.length, sheet: S && S.sheet.name, layout: S && S.layout, base: baseState().base, baseAuto,
         dgd: dgd === 'reading' ? 'reading' : dgd && { files: dgd.files.length, iins: dgd.byIin.size, orders: (dgd.orders || []).length,
