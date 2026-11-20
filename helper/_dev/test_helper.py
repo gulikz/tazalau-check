@@ -165,8 +165,8 @@ class Site:
             return route.continue_()
         if url.hostname == "example.org":
             return route.fulfill(body="<!doctype html><title>other</title><p>other site</p>", headers={"content-type": "text/html"})
-        if url.hostname and url.hostname.endswith(".kgd.gov.kz") and getattr(self, "kgd", None):
-            return self.kgd.handle(route, request)
+        if url.hostname in ("www.gov.kz", "gov.kz") and getattr(self, "gov", None):
+            return self.gov.handle(route, request)
         if url.hostname != "tazalau.qoldau.kz":
             return route.abort()                                   # наружу не выходит ничего
         if url.path == "/icons/style.css":                         # значковый шрифт описан так же, как на настоящем сайте
@@ -228,71 +228,105 @@ def order_scan(iin, fio, kind="pdf", dpi=200, blank=False):
     return buf.getvalue()
 
 
-class KgdSite:
-    """Макет сайтов ДГД 20 регионов (один Drupal): меню «Физическим лицам», страницы приказов в разных видах,
-    как на настоящих сайтах (сверено с копиями страниц 2024–2025 гг.), файлы-сканы. Имена и ИИН выдуманы."""
-    HOSTS = ["abai", "akm", "akb", "alm", "atr", "vko", "zhmb", "zhts", "zko", "krg", "kst", "kzl", "mng", "pvl", "sko", "trk", "ult",
-             "astana", "almaty", "shymkent"]
+def turbo(root):
+    """Данные страницы gov.kz в том же виде, что у настоящего сайта: плоский массив значений turbo-stream (React Router)."""
+    vals, known = [], {}
 
-    def __init__(self, today):
-        self.today = today
-        self.down = set()                  # сайты, которые не отвечают
-        self.no_page = set()               # в меню нет страницы приказов
-        self.calls = []                    # (метод, хост, путь)
-        self.files = {}                    # (хост, путь) -> (байты, тип, дата загрузки)
-        self.rows = {}                     # хост -> [строки таблицы: (ячейки html, [пути файлов])]
-        self.slug = {}
-        self.iins = {}                     # хост -> [(ИИН, ФИО)] по порядку приказов
+    def add(v):
+        if v is None:
+            return -5
+        if isinstance(v, (bool, int, float, str)):
+            key = (type(v).__name__, v)
+            if key not in known:
+                known[key] = len(vals)
+                vals.append(v)
+            return known[key]
+        i = len(vals)
+        vals.append(None)
+        vals[i] = [add(x) for x in v] if isinstance(v, list) else {"_" + str(add(k)): add(x) for k, x in v.items()}
+        return i
+    add(root)
+    return json.dumps(vals, ensure_ascii=False)
+
+
+class GovSite:
+    """Макет gov.kz для 20 департаментов ДГД: раздел «Документы» (данные в странице, как у настоящего сайта: turbo-stream),
+    страница публикации, где ссылку на файл достраивает скрипт страницы (как у настоящего сайта), файлы /uploads/.
+    Названия публикаций того же вида, что на gov.kz 20.11.2026; имена и ИИН выдуманы."""
+    SLUGS = ["kgd-abay", "kgd-akmola", "kgd-aktobe", "kgd-alm", "kgd-atyrau", "kgd-vko", "kgd-zhambyl", "kgd-zhetysu", "kgd-zko", "kgd-karaganda",
+             "kgd-kostanay", "kgd-kyzylorda", "kgd-mangistau", "kgd-pavlodar", "kgd-sko", "kgd-turkistan", "kgd-ulytau", "kgd-astana", "kgd-almaty", "kgd-shymkent"]
+
+    def __init__(self, now):
+        self.now = now
+        self.docs = {s: [] for s in self.SLUGS}     # slug -> [{id, title, date, file: (path, bytes, type) | None, mode}]
+        self.down = set()
+        self.calls = []
+        self.next_id = 1100000
 
     def day(self, n):
-        return (self.today - datetime.timedelta(days=n)).strftime("%d.%m.%Y")
+        return (self.now - datetime.timedelta(days=n)).strftime("%d.%m.%Y")
 
-    def add_file(self, host, path, data, ctype, ago):
-        self.files[(host, path)] = (data, ctype, self.today - datetime.timedelta(days=ago))
+    def add(self, slug, title, ago, data=None, ctype="application/pdf", mode="link"):
+        self.next_id += 1
+        ext = {"application/pdf": "pdf", "image/jpeg": "jpg",
+               "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx"}.get(ctype, "bin")
+        path = f"/uploads/2026/11/{self.next_id % 28 + 1}/{self.next_id:x}abc_original.{len(data or b'')}.{ext}" if data else None
+        self.docs[slug].append({"id": self.next_id, "title": title, "date": self.now - datetime.timedelta(days=ago, hours=1),
+                                "file": (path, data, ctype) if data else None, "mode": mode})
+        return self.next_id
 
-    def menu(self, host):
-        slug = self.slug.get(host, f"prikazy-o-naznacheniiotstranenii-osvobozhdenii-finansovogo-upravlyayushchego-{host}")
-        y = self.today.year
-        items = [f'<li><a href="/ru/depsection/fizicheskim-licam">Физическим лицам</a><ul>',
-                 f'<li><a href="/ru/content/{y - 1}-god-{host}">{y - 1} год. Восстановление платежеспособности и банкротство граждан</a><ul>',
-                 (f'<li><a href="/ru/content/{slug}-old">Приказы о назначении/отстранении (освобождении) финансового управляющего</a></li>'
-                  if host not in self.no_page else '') + '</ul></li>',
-                 f'<li><a href="/ru/content/{y}-god-{host}">{y} год. Восстановление платежеспособности и банкротство граждан</a><ul>']
-        if host not in self.no_page:
-            title = ("Приказы о назначении и отстранении реабилитационных, банкротных управляющих" if host == "kst"
-                     else "Приказы о назначении/отстранении (освобождении) финансового управляющего")
-            items.append(f'<li><a href="/ru/content/{slug}">{title}</a></li>')
-        items.append('<li><a href="/ru/content/reestry-trebovaniy">Реестры требований кредиторов</a></li></ul></li></ul></li>'
-                     '<li><a href="/ru/depsection/reabilitaciya">Реабилитация и банкротство</a><ul><li><a href="/ru/content/prikazy-reabil">'
-                     'Приказы о назначении/отстранении (освобождении) реабилитационного и банкротного управляющих</a></li></ul></li>')
-        return '<ul class="menu sm">' + "".join(items) + "</ul>"
-
-    def page(self, host, body):
-        return (f'<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>ДГД {host}</title></head>'
-                f'<body class="html not-front domain-{host}-kgd-gov-kz"><div id="sidebar">{self.menu(host)}</div>'
-                f'<div id="content"><div class="node"><div class="field field-name-body"><div class="field-items"><div class="field-item">'
-                f'{body}</div></div></div></div></div></body></html>')
-
-    def table(self, host):
-        trs = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>" for cells, _ in self.rows.get(host, []))
-        return f"<table><tbody><tr><td>Наименование</td><td>ФИО</td><td>Дата</td></tr>{trs}</tbody></table>"
+    def page(self, queries, extra=""):
+        line = turbo({"loaderData": {"document-detail": {"critical": {"publicQueries": queries}}}}) + "\n"
+        return ('<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>gov.kz</title></head><body><div id="root">Загрузка…</div>'
+                f'<script>window.__reactRouterContext={{streamController:{{enqueue:function(){{}}}}}};'
+                f'window.__reactRouterContext.streamController.enqueue({json.dumps(line, ensure_ascii=False)});</script>{extra}</body></html>')
 
     def handle(self, route, request):
         url = urllib.parse.urlsplit(request.url)
-        host = url.hostname.split(".")[0]
-        self.calls.append((request.method, host, url.path))
-        if host in self.down:
-            return route.abort("timedout")
         path = urllib.parse.unquote(url.path)
-        if (host, path) in self.files:
-            data, ctype, when = self.files[(host, path)]
-            stamp = when.strftime("%a, %d %b %Y 10:00:00 GMT")
-            return route.fulfill(status=200, headers={"content-type": ctype, "last-modified": stamp}, body=b"" if request.method == "HEAD" else data)
-        slug = self.slug.get(host, f"prikazy-o-naznacheniiotstranenii-osvobozhdenii-finansovogo-upravlyayushchego-{host}")
-        if path == f"/ru/content/{slug}":
-            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page(host, self.table(host)))
-        if path.startswith("/ru/"):
-            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page(host, "<p>Раздел</p>"))
+        q = urllib.parse.parse_qs(url.query)
+        self.calls.append((request.method, path))
+        m = re.match(r"^/org/([a-z-]+)/documents/(\d+)$", path)
+        if m and m.group(1) in self.docs:
+            slug, n = m.group(1), int(m.group(2))
+            if slug in self.down:
+                return route.abort("timedout")
+            size = int((q.get("size") or ["10"])[0])
+            docs = sorted(self.docs[slug], key=lambda d: -d["date"].timestamp())
+            part = docs[(n - 1) * size: n * size]
+            data = [{"id": d["id"], "projects": slug, "title": d["title"], "created_date": d["date"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "type": {"content_type_slug": "document_type", "items": [{"id": 3, "type": "Информация"}]}} for d in part]
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page([
+                {"endpointName": "getHeaderData", "arg": {"slug": slug}, "value": {"organizations": {slug: {"shortname": "ДГД " + slug}}}},
+                {"endpointName": "getFilteredData", "arg": {"slug": slug, "filters": {"page": n, "size": size}}, "value": {"data": data, "count": len(docs)}}]))
+        m = re.match(r"^/org/([a-z-]+)/documents/details/(\d+)$", path)
+        if m and m.group(1) in self.docs:
+            doc = next((d for d in self.docs[m.group(1)] if d["id"] == int(m.group(2))), None)
+            if not doc:
+                return route.fulfill(status=404, headers={"content-type": "text/html"}, body="<h1>404</h1>")
+            f = doc["file"]
+            if not f or doc["mode"] == "none":
+                script = "<script>setTimeout(function(){document.getElementById('root').innerHTML='Файлы для скачивания mainFileNotExist';},200);</script>"
+            elif doc["mode"] == "api":                         # ссылки нет: адрес файла приходит странице в ответе сайта
+                script = (f"<script>fetch('/api/v1/public/assets/info?ids={doc['id']}').then(function(r){{return r.json()}}).then(function(j){{"
+                          "document.getElementById('root').innerHTML='<button>Скачать</button>';});</script>")
+            else:
+                script = (f"<script>setTimeout(function(){{document.getElementById('root').innerHTML='<p>{html.escape(doc['title'])}</p>"
+                          f"<a href=\"{f[0]}\">Скачать файл</a>';}},300);</script>")
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page([
+                {"endpointName": "getDocumentById", "arg": {"id": str(doc["id"])},
+                 "value": {"id": str(doc["id"]), "title": doc["title"], "content": "", "mainFile": [{"id": doc["id"] * 7, "name": doc["title"]}], "files": []}}],
+                script))
+        if path == "/api/v1/public/assets/info":
+            doc = next((d for ds in self.docs.values() for d in ds if str(d["id"]) == (q.get("ids") or [""])[0]), None)
+            body = json.dumps([{"id": doc["id"] * 7, "path": doc["file"][0]}] if doc and doc["file"] else [])
+            return route.fulfill(headers={"content-type": "application/json"}, body=body)
+        if path.startswith("/uploads/"):
+            f = next((d["file"] for ds in self.docs.values() for d in ds if d["file"] and d["file"][0] == path), None)
+            if not f:
+                return route.fulfill(status=404, headers={"content-type": "text/html"}, body="<h1>404</h1>")
+            return route.fulfill(status=200, headers={"content-type": f[2], "content-disposition": 'attachment; filename="file.' + f[0].rsplit(".", 1)[1] + '"'},
+                                 body=b"" if request.method == "HEAD" else f[1])
         return route.fulfill(status=404, headers={"content-type": "text/html"}, body="<h1>404</h1>")
 
 
@@ -1162,7 +1196,7 @@ with sync_playwright() as p:
     summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
     reg, iins, files = summary["Регионы"], summary["ИИН"], summary["Файлы"]
     rows = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 15)] for r in range(2, reg.max_row + 1)}
-    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом", summary.sheetnames == ["Регионы", "Приказы", "ИИН", "Файлы"] and len(rows) == 21
+    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом", summary.sheetnames == ["Регионы", "Публикации", "ИИН", "Файлы"] and len(rows) == 21
            and rows["Акмолинская обл."][1] == "нет списка" and reg.cell(list(rows).index("Акмолинская обл.") + 2, 2).fill.fgColor.rgb.endswith("FFC7CE")
            and rows["Павлодарская обл."][1] == "в порядке" and reg.cell(list(rows).index("Павлодарская обл.") + 2, 2).fill.fgColor.rgb.endswith("C6EFCE")
            and rows["Павлодарская обл."][2] == "нет" and rows["Павлодарская обл."][11] == d0, rows.get("Павлодарская обл."))
@@ -1211,200 +1245,186 @@ with sync_playwright() as p:
     expect("PDF: скан без текста распознан как скан", "скан" in probe["note"], probe)
     page.close()
 
-    # ---------- 3з. ДГД: сбор приказов с сайтов 20 регионов (окно сайта + закладка в нём) ----------
+    # ---------- 3з. ДГД: сбор публикаций с gov.kz (вкладка gov.kz + одна закладка в ней) ----------
     if TNR:
         now = datetime.datetime.now()
-        kgd = KgdSite(now)
-        site.kgd = kgd
+        gov = GovSite(now)
+        site.gov = gov
         seq = iter(range(100, 999))
-        made = {}                                                     # ИИН -> (хост, ФИО)
+        made = {}                                                     # ИИН -> (slug, ФИО)
 
-        def person(host, fio, ago, style="kzl", kind="pdf", readable=True, text_layer=False):
+        def person(slug, title, fio, ago, kind="pdf", readable=True, mode="link", docx_text=False, text_layer=False):
             n = next(seq)
             born = now - datetime.timedelta(days=365 * (30 + n % 25) + n)
             iin = plausible(born.strftime("%y%m%d") + str(3 + n % 2))
-            fname = f"/sites/default/files/u{n}/prikaz_{n}.{'jpg' if kind == 'jpg' else 'pdf'}"
-            if text_layer:
-                buf = io.BytesIO(); cv = rl_canvas.Canvas(buf); cv.setFont("Helvetica", 12)
-                cv.drawString(72, 760, f"Order {n}: IIN {iin}"); cv.save(); data = buf.getvalue()
+            if docx_text:
+                d = docx.Document(); d.add_paragraph(f"Объявление. Должник {fio}, ИИН {iin}. Финансовый управляющий Тестов Т.Т.")
+                buf = io.BytesIO(); d.save(buf); data, ctype = buf.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif text_layer:
+                buf = io.BytesIO(); cv = rl_canvas.Canvas(buf); cv.setFont("Helvetica", 12); cv.drawString(72, 760, f"Order {n}: IIN {iin}"); cv.save()
+                data, ctype = buf.getvalue(), "application/pdf"
             else:
-                data = order_scan(iin, fio, kind, blank=not readable)
-            kgd.add_file(host, fname, data, "image/jpeg" if kind == "jpg" else "application/pdf", ago)
-            link = f'<a href="https://{host}.kgd.gov.kz{fname}">'
-            if style == "kzl":
-                cells = [f"{link}Приказ о назначении финансовым управляющим Тестов Т.Т. в отношении ФЛ {fio} от {kgd.day(ago)} г.</a>"]
-            elif style == "almaty":
-                cells = [f"{link}Приказ о назначении финансового управляющего по заявлению должника {fio}</a>", "Сидорова Анна Сергеевна", kgd.day(ago)]
-            elif style == "atr":
-                cells = [f"{link}{fio}</a>", str(n)]
-            else:
-                cells = [f"{link}{fio}</a>", kgd.day(ago)]
-            kgd.rows.setdefault(host, []).append((cells, [fname]))
+                data, ctype = order_scan(iin, fio, kind, blank=not readable), "image/jpeg" if kind == "jpg" else "application/pdf"
+            gov.add(slug, title.format(fio=fio, day=gov.day(ago)), ago, data, ctype, mode)
             if readable:
-                made[iin] = (host, fio)
+                made[iin] = (slug, fio)
             return iin
 
-        K1, K2, K3 = (person("kzl", f, a) for f, a in [("Кызылова Кайрата Ивановича", 1), ("Сейтовой Алмы Ериковны", 2), ("Жумабаева Нурлана", 3)])
-        person("kzl", "Старова Олега Петровича", 40)
-        A1, A2 = person("almaty", "Ахметова Айгерима", 1, "almaty", "jpg"), person("almaty", "Борисовой Веры", 2, "almaty", "jpg")
-        person("almaty", "Нечитаемовой Нины Николаевны", 3, "almaty", "jpg", readable=False)
-        kgd.rows["almaty"].append((['<a href="https://www.gov.kz/memleket/entities/kgd-almaty/documents/details/123">Приказ о назначении финансового '
-                                    'управляющего по заявлению должника Гостевой Галины</a>', "Сидорова Анна Сергеевна", kgd.day(4)], []))
-        for f, a in [("Атыраев Арман Нурланович", 1), ("Бекова Дана Маратовна", 2), ("Сагиев Ерлан Кайратович", 3), ("Давний Дмитрий Иванович", 90)]:
-            person("atr", f, a, "atr")
-        kgd.slug["kst"] = "prikazy-o-naznachenii-i-otstranenii-finansovyh-upravlyayushchih-12"
-        for f, a in [("Костин К.К.", 1), ("Лаврова Л.Л.", 4), ("Маратов М.М.", 6)]:
-            person("kst", f, a, "plain")
-        person("abai", "Абаев А.А.", 2, "plain")
-        for f, a in [("Старый С.С.", 60), ("Старая С.С.", 70)]:
-            person("akm", f, a, "plain")
-        for f, a in [("Павлов П.П.", 20), ("Павлова П.П.", 25)]:
-            person("pvl", f, a, "plain")
-        V1 = person("vko", "Восточный В.В.", 1, "plain", text_layer=True)
-        for f, a in [("Восточная В.В.", 2), ("Восточнов В.В.", 3)]:
-            person("vko", f, a, "plain")
-        kgd.down.add("mng")
-        kgd.no_page.add("zko")
-        for host in ["akb", "alm", "zhmb", "zhts", "krg", "sko", "trk", "ult", "astana", "shymkent"]:
+        ORDER = "Приказ о назначении финансового управляющего Тестов Т.Т. в отношении ФЛ {fio} от {day} г."
+        RTK = "РТК должник {fio}"
+        ANN = "Объявление о возбуждении производства по делу о применении процедуры судебного банкротства граждан РК {fio}"
+        K1, K2 = person("kgd-kyzylorda", ORDER, "Кызылова Кайрата Ивановича", 1), person("kgd-kyzylorda", ORDER, "Сейтовой Алмы Ериковны", 2)
+        K3 = person("kgd-kyzylorda", RTK, "ЖУМАБАЕВ НУРЛАН", 3)
+        person("kgd-kyzylorda", ORDER, "Старова Олега Петровича", 40)
+        gov.add("kgd-kyzylorda", 'РТК ТОО "Тест Строй"', 1, b"%PDF-1.4 x", "application/pdf")
+        gov.add("kgd-kyzylorda", "Список лиц, подлежащих назначению в качестве финансовых управляющих", 2, b"%PDF-1.4 x", "application/pdf")
+        A1, A2 = person("kgd-almaty", RTK, "АХМЕТОВА АЙГЕРИМ", 1), person("kgd-almaty", RTK, "БОРИСОВА ВЕРА", 2, "jpg")
+        person("kgd-almaty", RTK, "НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА", 3, "jpg", readable=False)
+        D1 = person("kgd-almaty", ANN, "Гостева Галина", 4, docx_text=True)
+        gov.down.add("kgd-atyrau")
+        person("kgd-abay", ORDER, "Абаева Арнура", 2)
+        for f, a in [("Старого Семёна", 60), ("Старой Софии", 70)]:
+            person("kgd-akmola", ORDER, f, a)
+        for f, a in [("Павлова Петра", 20), ("Павловой Полины", 25)]:
+            person("kgd-pavlodar", ORDER, f, a)
+        V1 = person("kgd-vko", ORDER, "Восточного Виктора", 1, text_layer=True)
+        for f, a in [("Восточной Веры", 2), ("Восточнова Василия", 3)]:
+            person("kgd-vko", ORDER, f, a)
+        for f, a in [("Западного Захара", 1), ("Западной Зои", 2)]:
+            person("kgd-zko", ORDER, f, a)
+        gov.add("kgd-zko", ANN.format(fio="Безфайлова Бориса"), 3, None)
+        Q1 = person("kgd-kostanay", RTK, "КОСТИН КИРИЛЛ", 1, mode="api")
+        for f, a in [("ЛАВРОВА ЛИЯ", 4), ("МАРАТОВ МАРАТ", 6)]:
+            person("kgd-kostanay", RTK, f, a)
+        for slug in ["kgd-aktobe", "kgd-alm", "kgd-zhambyl", "kgd-zhetysu", "kgd-karaganda", "kgd-mangistau", "kgd-sko", "kgd-turkistan",
+                     "kgd-ulytau", "kgd-astana", "kgd-shymkent"]:
             for i in range(3):
-                person(host, f"Тестов{host.capitalize()} Т{i}.Т.", 1 + i, "plain")
+                person(slug, ORDER, f"Тестова{slug[4:].capitalize()} Т{i}.Т.", 1 + i)
         N1, X1 = plausible("8801014"), plausible("7702023")
         work = fio_book("FIO", [("ПОСТОРОННИЙ ПЁТР ПЕТРОВИЧ", X1), ("НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА", N1), ("КЫЗЫЛОВ КАЙРАТ ИВАНОВИЧ", K1)])
         site.calls.clear()
         site.found = {}
         page = open_helper(ctx, site, {"width": 1366, "height": 900})
-        opfs_put(page, "ADW.xlsx", work, "kgd")
-        use_folder(page, "kgd")
+        opfs_put(page, "ADW.xlsx", work, "gov")
+        use_folder(page, "gov")
         page.wait_for_function("() => { const d = window.__tazalau.test.state().dgd; return d !== 'reading'; }", timeout=30000)
-        expect("сбор ДГД: кнопка видна, пока в папке нет ДГД", page.get_by_role("button", name="🌐 Собрать ДГД с сайтов").is_visible())
 
         def collect_all(stop_after=None):
             with page.expect_popup() as info:
-                page.get_by_role("button", name="🌐 Собрать ДГД с сайтов").click()
-            popup = info.value
-            done = []
-            for _ in range(60):
-                st = page.evaluate("() => window.__tazalau.test.collecting()")
-                if not st or st["finishing"]:
-                    break
-                cur = next((x for x in st["sites"] if x["state"] in ("open", "work")), None)
-                if not cur:
-                    break
-                host = cur["key"]
-                if stop_after is not None and len(done) >= stop_after:
-                    page.get_by_role("button", name="Закончить сбор").click()
-                    break
-                if cur["state"] == "open":
-                    if host in kgd.down:
-                        page.wait_for_timeout(300)
-                        page.get_by_role("button", name="Пропустить регион").click()
-                        done.append(host)
-                        continue
-                    popup.wait_for_url(f"https://{host}.kgd.gov.kz/**", timeout=20000)
-                    popup.wait_for_load_state("domcontentloaded")
-                    ctx.new_cdp_session(popup).send("Page.navigate", {"url": HREF})        # закладка в окне сайта
-                page.wait_for_function("""key => { const c = window.__tazalau.test.collecting(); if (!c) return true;
-                    const s = c.sites.find(x => x.key === key); return s.state !== 'open' && s.state !== 'work'; }""", arg=host, timeout=90000)
-                done.append(host)
+                page.get_by_role("button", name="🌐 Собрать ДГД с gov.kz").click()
+            tab = info.value
+            tab.wait_for_load_state("domcontentloaded")
+            expect("сбор ДГД: вкладка gov.kz открыта, помощник просит нажать закладку", "нажмите в ней закладку" in page.inner_text("#tazalau-collect")
+                   and tab.url.startswith("https://www.gov.kz/org/"), tab.url)
+            ctx.new_cdp_session(tab).send("Page.navigate", {"url": HREF})        # одна закладка во вкладке gov.kz
+            if stop_after:
+                page.wait_for_function("n => { const c = window.__tazalau.test.collecting(); return !c || c.sites.filter(x => x.state === 'done').length >= n; }",
+                                       arg=stop_after, timeout=120000)
+                page.get_by_role("button", name="Закончить сбор").click()
             page.wait_for_function("() => !window.__tazalau.test.collecting() && /ДГД собраны/.test(document.querySelector('#tazalau-state').textContent)",
-                                   timeout=180000)
-            return done
+                                   timeout=400000)
+            return tab
 
-        done = collect_all()
+        tab = collect_all()
         said = page.evaluate(STATE)
-        expect("сбор ДГД: пройдены все 20 сайтов по очереди, итог в окне", len(done) == 20 and "ДГД собраны: 18 из 20" in said, (done, said))
-        tree = opfs_tree(page, "kgd")
+        expect("сбор ДГД: все 20 регионов собраны с gov.kz по одному нажатию закладки, итог в окне", "ДГД собраны: 19 из 20" in said and tab.is_closed(), said)
+        tree = opfs_tree(page, "gov")
         kz = [k for k in tree if k.startswith("ДГД/Кызылординская область/") and not k.endswith(".json")]
-        expect("сбор ДГД: скачаны только приказы за 31 день (Кызылорда: 3 из 4), в папку региона", len(kz) == 3
-               and "ДГД/Кызылординская область/приказы_с_сайта.json" in tree, sorted(kz))
-        al = [k for k in tree if k.startswith("ДГД/г. Алматы/") and not k.endswith(".json")]
-        expect("сбор ДГД: JPEG-сканы скачаны, ссылка на gov.kz не скачивается", len(al) == 3 and all(k.endswith(".jpg") for k in al), al)
-        at = [k for k in tree if k.startswith("ДГД/Атырауская область/") and not k.endswith(".json")]
-        expect("сбор ДГД: строки без даты: дата загрузки файла на сайт (Атырау: 3 свежих из 4)", len(at) == 3, at)
-        heads = [c for c in kgd.calls if c[0] == "HEAD"]
-        expect("сбор ДГД: для строк без даты сначала запрос даты (HEAD), без скачивания", len(heads) == 4 and all(c[1] == "atr" for c in heads), heads)
-        expect("сбор ДГД: распознанные ИИН запомнены в ДГД/распознано.json", "ДГД/распознано.json" in tree
-               and K1 in tree["ДГД/распознано.json"].decode("utf-8"))
+        expect("сбор ДГД: скачаны только публикации граждан за 31 день (Кызылорда: 3 из 6: без старой, ТОО и списка управляющих)", len(kz) == 3
+               and "ДГД/Кызылординская область/публикации_gov_kz.json" in tree, sorted(kz))
+        al = sorted(k for k in tree if k.startswith("ДГД/г. Алматы/") and not k.endswith(".json"))
+        expect("сбор ДГД: PDF, JPEG и Word скачаны", len(al) == 4 and sum(k.endswith(".jpg") for k in al) == 2 and sum(k.endswith(".docx") for k in al) == 1, al)
+        ks = [k for k in tree if k.startswith("ДГД/Костанайская область/") and not k.endswith(".json")]
+        expect("сбор ДГД: адрес файла найден в ответе сайта странице, когда ссылки на странице нет", len(ks) == 3, ks)
+        expect("сбор ДГД: распознанные ИИН запомнены в ДГД/распознано.json", "ДГД/распознано.json" in tree and K1 in tree["ДГД/распознано.json"].decode("utf-8"))
         regions = {r["name"]: r for r in page.evaluate("() => window.__tazalau.test.state().dgd.regions")}
-        want = {"Кызылординская обл.": ("good", "в порядке"), "Костанайская обл.": ("good", "в порядке"),
-                "Атырауская обл.": ("good", "в порядке"), "Восточно-Казахстанская обл.": ("good", "в порядке"),
-                "г. Алматы": ("warn", "ИИН не прочитан в приказах: 1"), "Абайская обл.": ("warn", "всего 1 приказ за 31 дн."),
-                "Акмолинская обл.": ("bad", "0 приказов за 31 дн."), "Павлодарская обл.": ("warn", "всего 2 приказа за 31 дн."),
-                "Мангистауская обл.": ("bad", "сайт не открылся"), "Западно-Казахстанская обл.": ("bad", "в меню сайта нет страницы")}
+        want = {"Кызылординская обл.": ("good", "в порядке"), "Восточно-Казахстанская обл.": ("good", "в порядке"), "Костанайская обл.": ("good", "в порядке"),
+                "г. Алматы": ("warn", "ИИН не прочитан в публикациях: 1"), "Абайская обл.": ("warn", "всего 1 публикация за 31 дн."),
+                "Акмолинская обл.": ("bad", "0 публикаций за 31 дн."), "Павлодарская обл.": ("warn", "всего 2 публикации за 31 дн."),
+                "Атырауская обл.": ("bad", "раздел «Документы» на gov.kz не открылся"), "Западно-Казахстанская обл.": ("warn", "без файла: 1")}
         for name, (level, text) in want.items():
             r = regions[name]
             expect(f"сбор ДГД: проверка региона: {name}: {text}", r["level"] == level and text in r["text"], r)
-        expect("сбор ДГД: свежесть: последний приказ 20 дн. назад отмечен", "последний приказ " + kgd.day(20) + ": 20 дн. назад" in regions["Павлодарская обл."]["text"],
+        expect("сбор ДГД: свежесть: последняя публикация 20 дн. назад отмечена", "последняя публикация " + gov.day(20) + ": 20 дн. назад" in regions["Павлодарская обл."]["text"],
                regions["Павлодарская обл."])
-        expect("сбор ДГД: приказ на gov.kz отмечен для ручной загрузки", "приказы на gov.kz: 1" in regions["г. Алматы"]["text"], regions["г. Алматы"])
-        expect("сбор ДГД: Костанай найден по адресу страницы, хотя пункт меню назван иначе", regions["Костанайская обл."]["win"] == 3, regions["Костанайская обл."])
-        dg = page.evaluate("() => window.__tazalau.test.state().dgd")
-        read = {i for i in made}
-        expect("сбор ДГД: ИИН прочитаны со сканов PDF и JPEG и из текста PDF: все читаемые за 31 день", dg["iins"] >= 40, dg)
         summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
-        orders = summary["Приказы"]
+        pubs = summary["Публикации"]
         got = {}
-        for r in range(2, orders.max_row + 1):
-            for iin in str(orders.cell(r, 6).value or "").split(", "):
-                got[iin] = [orders.cell(r, c).value for c in range(1, 11)] + [orders.cell(r, 8).hyperlink]
-        expect("сбор ДГД: свод, лист «Приказы»: регион, дата, вид, должник, управляющий, ИИН, как прочитан, файл со ссылкой",
-               got.get(K1, [None])[0] == "Кызылординская обл." and got[K1][1] == kgd.day(1) and got[K1][2] == "назначение"
+        for r in range(2, pubs.max_row + 1):
+            for iin in str(pubs.cell(r, 6).value or "").split(", "):
+                got[iin] = [pubs.cell(r, c).value for c in range(1, 12)] + [pubs.cell(r, 8).hyperlink, pubs.cell(r, 9).hyperlink]
+        expect("сбор ДГД: свод, лист «Публикации»: регион, дата, вид, должник, управляющий, ИИН, как прочитан, файл и публикация со ссылками",
+               got.get(K1, [None])[0] == "Кызылординская обл." and got[K1][1] == gov.day(1) and got[K1][2] == "приказ (назначение)"
                and got[K1][3] == "Кызылова Кайрата Ивановича" and got[K1][4] == "Тестов Т.Т." and got[K1][6] == "распознано со скана"
-               and got[K1][10] is not None and got.get(V1, [None] * 7)[6] == "текст PDF" and got.get(A1, [None])[0] == "г. Алматы", got.get(K1))
+               and got[K1][11] is not None and "gov.kz/org/kgd-kyzylorda/documents/details/" in str(got[K1][12].target)
+               and got.get(K3, [None] * 4)[2] == "реестр требований кредиторов" and got[K3][3] == "ЖУМАБАЕВ НУРЛАН"
+               and got.get(V1, [None] * 7)[6] == "текст PDF" and got.get(D1, [None] * 7)[6] == "текст файла"
+               and str(got.get(D1, [None] * 3)[2]).startswith("объявление о возбуждении дела, судебное банкротство"), (got.get(K1), got.get(K3), got.get(D1)))
         wrong = [i for i in got if i and i.isdigit() and i not in made]
-        expect("сбор ДГД: ни одного чужого ИИН (только те, что в приказах)", not wrong, wrong)
-        missed = [i for i in made if i not in got and kgd.files]
-        old_ok = {i for i, (h, f) in made.items() if h in ("akm", "pvl") or f in ("Старова Олега Петровича", "Давний Дмитрий Иванович")}
-        expect("сбор ДГД: все читаемые приказы за 31 день прочитаны", not [i for i in missed if i not in old_ok], [made[i] for i in missed if i not in old_ok])
+        expect("сбор ДГД: ни одного чужого ИИН", not wrong, wrong)
+        old_ok = {i for i, (sl, f) in made.items() if sl in ("kgd-akmola", "kgd-pavlodar") or f in ("Старова Олега Петровича",)}
+        missed = [made[i] for i in made if i not in got and i not in old_ok]
+        expect("сбор ДГД: все читаемые публикации за 31 день прочитаны (скан PDF, JPEG, текст PDF, Word)", not missed, missed)
         reg = summary["Регионы"]
         row = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 15)] for r in range(2, reg.max_row + 1)}
-        expect("сбор ДГД: свод, лист «Регионы»: сбор, последний приказ, приказов за 31 день, прочитано, страница на сайте",
-               row["Кызылординская обл."][2] == now.strftime("%d.%m.%Y") and row["Кызылординская обл."][3] == kgd.day(1)
-               and row["Кызылординская обл."][4] == "3" and row["Кызылординская обл."][6] == "3" and "kzl.kgd.gov.kz/ru/content/" in str(row["Кызылординская обл."][12])
-               and str(row["Мангистауская обл."][2]).startswith("не открылся"), row["Кызылординская обл."])
+        expect("сбор ДГД: свод, лист «Регионы»: сбор, последняя публикация, публикаций за 31 день, прочитано, раздел на gov.kz",
+               row["Кызылординская обл."][2] == now.strftime("%d.%m.%Y") and row["Кызылординская обл."][3] == gov.day(1)
+               and row["Кызылординская обл."][4] == "3" and row["Кызылординская обл."][6] == "3"
+               and str(row["Кызылординская обл."][12]) == "https://www.gov.kz/org/kgd-kyzylorda/documents/1?lang=ru"
+               and str(row["Атырауская обл."][2]).startswith("не открылся"), row["Кызылординская обл."])
         final = run_and_wait(page)
-        tree = opfs_tree(page, "kgd")
-        expect("сбор ДГД: ИИН из приказов ДГД проверяются на tazalau первыми", [c[1] for c in site.calls][:1] == [K1], site.calls[:3])
+        tree = opfs_tree(page, "gov")
+        expect("сбор ДГД: ИИН из публикаций ДГД проверяются на tazalau первыми", [c[1] for c in site.calls][:1] == [K1], site.calls[:3])
         ws = load_workbook(io.BytesIO(tree["ADW.xlsx"]))["ИИН"]
         col = [ws.cell(1, c).value for c in range(1, 12)].index("ДГД") + 1
         vals = {ws.cell(r, 2).value: (ws.cell(r, col).value, ws.cell(r, col).hyperlink) for r in range(2, 5)}
-        expect("сбор ДГД: в рабочем файле столбец «ДГД»: регион, приказ, дата, управляющий, ссылка на скан",
-               str(vals[K1][0]).startswith(f"Кызылординская обл., приказ о назначении от {kgd.day(1)}, управляющий: Тестов Т.Т.") and vals[K1][1] is not None
+        expect("сбор ДГД: в рабочем файле столбец «ДГД»: регион, вид и дата публикации, управляющий, ссылка на файл",
+               str(vals[K1][0]).startswith(f"Кызылординская обл., приказ (назначение) от {gov.day(1)}, управляющий: Тестов Т.Т.") and vals[K1][1] is not None
                and vals[X1][0] in (None, ""), vals)
-        expect("сбор ДГД: приказ без прочитанного ИИН сверен по ФИО: «возможно» со ссылкой на скан",
-               str(vals[N1][0]).startswith("⚠ возможно (по ФИО, ИИН в приказе не прочитан): г. Алматы, «Нечитаемовой Нины Николаевны»") and vals[N1][1] is not None,
+        expect("сбор ДГД: публикация без прочитанного ИИН сверена по ФИО: «возможно» со ссылкой на файл",
+               str(vals[N1][0]).startswith("⚠ возможно (по ФИО, ИИН в файле не прочитан): г. Алматы, «НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА»") and vals[N1][1] is not None,
                vals[N1])
-        # связной: чужие адреса не скачивает; без помощника только подсказывает
-        before = len([c for c in kgd.calls if c[2].startswith("/sites/")])
-        done2 = collect_all(stop_after=1)
-        after = len([c for c in kgd.calls if c[2].startswith("/sites/")])
-        expect("сбор ДГД: повторный сбор не скачивает уже сохранённые приказы", after == before and done2[:1] == ["abai"], (before, after, done2))
-        meta = json.loads(opfs_tree(page, "kgd")["ДГД/Абайская область/приказы_с_сайта.json"].decode("utf-8"))
+        before = len([c for c in gov.calls if c[1].startswith("/uploads/")])
+        collect_all(stop_after=2)
+        after = len([c for c in gov.calls if c[1].startswith("/uploads/")])
+        expect("сбор ДГД: повторный сбор не скачивает уже сохранённые файлы", after == before, (before, after))
+        meta = json.loads(opfs_tree(page, "gov")["ДГД/Абайская область/публикации_gov_kz.json"].decode("utf-8"))
         expect("сбор ДГД: дата «впервые увиден» сохраняется между сборами", meta["rows"][0]["firstSeen"] == now.strftime("%Y-%m-%d"), meta["rows"][0])
         lone = ctx.new_page()
-        lone.goto("https://abai.kgd.gov.kz/ru/depsection/fizicheskim-licam")
+        lone.goto("https://www.gov.kz/org/kgd-abay/documents/1?lang=ru")
         ctx.new_cdp_session(lone).send("Page.navigate", {"url": HREF})
-        lone.wait_for_function("() => document.body.innerText.includes('Это окно открыл не помощник')", timeout=10000)
-        expect("связной: окно сайта, открытое не помощником, только объясняет, что делать", True)
+        lone.wait_for_function("() => document.body.innerText.includes('Эту вкладку открыл не помощник')", timeout=10000)
+        expect("связной: вкладка gov.kz, открытая не помощником, только объясняет, что делать", True)
         lone.close()
+        doc_page = f"https://www.gov.kz/org/kgd-kyzylorda/documents/details/{gov.docs['kgd-kyzylorda'][0]['id']}?lang=ru"
         with page.expect_popup() as info:
-            page.evaluate("() => { window.__probe = window.open('https://kzl.kgd.gov.kz/ru/depsection/fizicheskim-licam', 'probe'); }")
+            page.evaluate("() => { window.__probe = window.open('https://www.gov.kz/org/kgd-kyzylorda/documents/1?lang=ru', 'probe'); }")
         probe = info.value
         probe.wait_for_load_state("domcontentloaded")
         ctx.new_cdp_session(probe).send("Page.navigate", {"url": HREF})
         probe.wait_for_function("() => !!window.__tazalauRelay")
-        answers = page.evaluate("""() => new Promise(done => {
+        answers = page.evaluate("""url => new Promise(done => {
             const got = {};
-            const on = e => { if (e.data && e.data.tz === 'fetched') { got[e.data.id] = { ok: e.data.ok, err: e.data.error || '', size: e.data.bytes ? e.data.bytes.byteLength : 0 };
-              if (got[1] && got[2]) { window.removeEventListener('message', on); done(got); } } };
+            const on = e => { if (e.data && e.data.tz === 'fetched') { got[e.data.id] = { ok: e.data.ok, err: e.data.error || '', size: e.data.bytes ? e.data.bytes.byteLength : 0,
+              links: (e.data.links || []).map(l => l.href) };
+              if (got[1] && got[2] && got[3]) { window.removeEventListener('message', on); done(got); } } };
             window.addEventListener('message', on);
-            window.__probe.postMessage({ tz: 'fetch', id: 1, url: 'https://example.org/secret' }, 'https://kzl.kgd.gov.kz');
-            window.__probe.postMessage({ tz: 'fetch', id: 2, url: '/ru/depsection/fizicheskim-licam' }, 'https://kzl.kgd.gov.kz');
-            setTimeout(() => done(got), 8000); })""")
-        expect("связной: чужой адрес не скачивает, адрес своего сайта скачивает",
+            window.__probe.postMessage({ tz: 'fetch', id: 1, url: 'https://example.org/secret' }, 'https://www.gov.kz');
+            window.__probe.postMessage({ tz: 'fetch', id: 2, url: '/org/kgd-abay/documents/1?lang=ru' }, 'https://www.gov.kz');
+            window.__probe.postMessage({ tz: 'frame', id: 3, url, wait: 8000 }, 'https://www.gov.kz');
+            setTimeout(() => done(got), 15000); })""", doc_page)
+        expect("связной: чужой адрес не скачивает, свой скачивает, ссылку на файл берёт из страницы в рамке",
                answers.get("1", {}).get("ok") is False and "другого сайта" in answers["1"]["err"] and answers.get("2", {}).get("ok") is True
-               and answers["2"]["size"] > 100, answers)
+               and answers["2"]["size"] > 100 and any("/uploads/" in h for h in answers.get("3", {}).get("links", [])), answers)
         probe.close()
+        rules = page.evaluate("""() => { const t = window.__tazalau.test, y = new Date().getFullYear();
+            const titles = ['Иванова Мария Владимировна', 'ТОО "SPS GROUP"', 'Информационные сообщения ФЛ ' + y, 'Список лиц, подлежащих назначению в качестве финансовых управляющих',
+              'Объявление о возбуждении производства по делу о банкротстве и порядке заявления требований кредиторами', 'РТК по процедуре ВП Тестбеков Т.',
+              'Объявление о признании должника банкротом и его ликвидации с возбуждением процедуры банкротства', 'Сведения о направленных уведомлениях лиц о начале деятельности финансовых управляющих'];
+            return titles.map(x => [t.isGovCitizenDoc(x), t.govYearly(x), t.govKind(x), t.govDebtor(x)]); }""")
+        expect("сбор ДГД: правила отбора на названиях как на gov.kz: ФИО, «ФЛ 2026» (сводная за год), ТОО, списки управляющих, объявления юрлиц",
+               [r[0] for r in rules] == [True, False, True, False, False, True, False, False] and rules[2][1] is True and rules[0][3] == "Иванова Мария Владимировна"
+               and rules[5][2] == "реестр требований кредиторов, восстановление платежеспособности" and rules[5][3] == "Тестбеков Т.", rules)
         expect("сбор ДГД: страница без ошибок", not page.errors, page.errors[:3])
         page.close()
 

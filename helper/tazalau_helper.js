@@ -1,6 +1,7 @@
-/* Tazalau помощник: версия 5.
+/* Tazalau помощник: версия 6.
    Закладка для tazalau.qoldau.kz (Edge или Chrome). Ничего не устанавливает. Ежедневная проверка в три шага:
-   1) списки ДГД (финансовые управляющие) из подпапки «ДГД»: ИИН, регион, дата, проверка каждого региона, свод;
+   1) ДГД: публикации 20 департаментов на gov.kz о процедурах граждан (приказы о финансовых управляющих, объявления о
+      возбуждении дел, реестры требований кредиторов) за 31 день: файлы, ИИН из них, проверка каждого региона, свод;
    2) рабочий файл: выгрузка ADW (xlsx или csv) с проблемными кредитами и картами, столбец с ИИН;
    3) по каждому ИИН все шесть реестров tazalau: статус, снимок страницы, ссылки в файл; ИИН из списков ДГД первыми.
    По файлу Excel (столбец «ИИН/БИН»): открывает реестр с фильтром по ИИН, проверяет, что на странице
@@ -10,9 +11,9 @@
    Вход на сайт и ЭЦП не нужны. Файл Excel читается и изменяется только внутри браузера и никуда не отправляется. */
 (() => {
   'use strict';
-  const VERSION = '5';
+  const VERSION = '6';
   if (window.__tazalau) { window.__tazalau.show(); return; }
-  if (/(^|\.)kgd\.gov\.kz$/i.test(location.hostname)) { relay(); return; }
+  if (/^(www\.)?gov\.kz$/i.test(location.hostname)) { relay(); return; }
   if (!/(^|\.)tazalau\.qoldau\.kz$/i.test(location.hostname)) {
     const check = document.getElementById('tazalau-check');
     if (check) {                    /* закладку нажали на странице установки: это проверка */
@@ -26,16 +27,18 @@
     return;
   }
 
-  /* На сайте ДГД (*.kgd.gov.kz) закладка работает связным. Браузер разрешает скачивать страницы и файлы сайта только
-     самому этому сайту, поэтому помощник из вкладки tazalau открывает сайт региона в отдельном окне, а закладка в этом
-     окне по его просьбе скачивает нужные адреса этого же сайта и передаёт их обратно. Чужие адреса не скачиваются,
-     просьбы принимаются только от окна tazalau.qoldau.kz, которое открыло это окно. Всё остальное делает помощник. */
+  /* На gov.kz закладка работает связным. Приказы и объявления ДГД всех 20 регионов лежат на gov.kz, а браузер разрешает
+     читать страницы и файлы gov.kz только странице самого gov.kz. Поэтому помощник из вкладки tazalau открывает вкладку
+     gov.kz, а закладка, нажатая там один раз, по просьбе помощника скачивает страницы и файлы gov.kz и передаёт их
+     обратно. Страницу публикации, где ссылку на файл достраивает сам сайт, связной открывает в невидимой рамке (тот же
+     сайт) и берёт ссылку оттуда, как человек со страницы. Чужие адреса не скачиваются, просьбы принимаются только от
+     вкладки tazalau.qoldau.kz, которая открыла эту вкладку. Всё остальное делает помощник. */
   function relay() {
     const HOME = 'https://tazalau.qoldau.kz';
     if (window.__tazalauRelay) { window.__tazalauRelay(); return; }
     if (!document.body) { document.addEventListener('DOMContentLoaded', relay, { once: true }); return; }   /* страница ещё грузится */
     const box = document.createElement('div');
-    box.style.cssText = 'position:fixed;top:10px;right:10px;z-index:2147483647;max-width:400px;padding:10px 12px;border-radius:8px;' +
+    box.style.cssText = 'position:fixed;top:10px;right:10px;z-index:2147483647;max-width:420px;padding:10px 12px;border-radius:8px;' +
       'background:#fff8e1;border:2px solid #e3b341;font:14px/1.45 Arial,sans-serif;color:#1d2433;box-shadow:0 2px 12px rgba(0,0,0,.25);white-space:pre-line;text-align:left';
     const say = t => { box.textContent = 'Tazalau ▶ ДГД (версия ' + VERSION + ')\n' + t; };
     document.body.appendChild(box);
@@ -43,29 +46,62 @@
     let opener = null;
     try { opener = window.opener; } catch (e) { opener = null; }
     if (!opener) {
-      say('Это окно открыл не помощник. Откройте tazalau.qoldau.kz, нажмите закладку Tazalau и кнопку «Собрать ДГД с сайтов»: ' +
-        'помощник сам откроет сайты ДГД по очереди в новой вкладке, а там останется только нажимать закладку.');
+      say('Эту вкладку открыл не помощник. Откройте tazalau.qoldau.kz, нажмите закладку Tazalau и кнопку «Собрать ДГД с gov.kz»: ' +
+        'помощник сам откроет вкладку gov.kz, а в ней останется один раз нажать закладку.');
       return;
     }
+    const FILE_HREF = /\/uploads\/|\/api\/v1\/public\/assets\/|\/api\/v2\/(public\/)?files\//i;
+    /* Страница публикации в невидимой рамке (тот же сайт): ссылки на файлы, которые показал сам сайт, и запросы страницы */
+    const frame = (url, wait) => new Promise(resolve => {
+      const f = document.createElement('iframe');
+      f.style.cssText = 'position:fixed;left:-12000px;top:0;width:1280px;height:900px;border:0';
+      f.setAttribute('aria-hidden', 'true');
+      f.src = url;
+      document.body.appendChild(f);
+      const t0 = Date.now();
+      const look = () => {
+        let links = [], resources = [], text = '';
+        try {
+          const d = f.contentDocument;
+          if (d && d.body) {
+            links = Array.from(d.querySelectorAll('a[href]')).filter(a => FILE_HREF.test(a.href) && new URL(a.href).origin === location.origin)
+              .map(a => ({ href: a.href, text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300) }));
+            text = (d.body.innerText || '').replace(/\s+/g, ' ').slice(0, 400);
+            resources = f.contentWindow.performance.getEntriesByType('resource').map(r => r.name)
+              .filter(n => n.startsWith(location.origin) && /\/api\//.test(n)).slice(0, 60);
+          }
+        } catch (e) { text = 'рамка не открылась: ' + ((e && e.message) || e); }
+        const done = links.length || Date.now() - t0 > wait || /mainFileNotExist|Файлы не найдены|Файлдар табылмады/i.test(text);
+        if (!done) { setTimeout(look, 600); return; }
+        setTimeout(() => f.remove(), 50);
+        resolve({ links, resources, text });
+      };
+      setTimeout(look, 800);
+    });
     window.addEventListener('message', async e => {
       const m = e.data;
       if (e.origin !== HOME || e.source !== opener || !m || typeof m.tz !== 'string') return;
       if (m.tz === 'say') { say(String(m.text || '')); return; }
-      if (m.tz !== 'fetch') return;
+      if (m.tz !== 'fetch' && m.tz !== 'frame') return;
       try {
         const u = new URL(String(m.url), location.href);
         if (u.origin !== location.origin) throw new Error('адрес другого сайта: ' + u.origin);
+        if (m.tz === 'frame') {
+          const r = await frame(u.href, Math.min(60000, +m.wait || 25000));
+          opener.postMessage({ tz: 'fetched', id: m.id, ok: true, status: 200, links: r.links, resources: r.resources, text: r.text }, HOME);
+          return;
+        }
         const head = m.method === 'HEAD';
         const r = await fetch(u.href, { method: head ? 'HEAD' : 'GET', credentials: 'same-origin', cache: 'no-cache', redirect: 'follow' });
         const buf = head ? new ArrayBuffer(0) : await r.arrayBuffer();
         opener.postMessage({ tz: 'fetched', id: m.id, ok: r.ok, status: r.status, type: r.headers.get('content-type') || '',
-          modified: r.headers.get('last-modified') || '', url: r.url, bytes: buf }, HOME, [buf]);
+          disposition: r.headers.get('content-disposition') || '', modified: r.headers.get('last-modified') || '', url: r.url, bytes: buf }, HOME, [buf]);
       } catch (err) {
         opener.postMessage({ tz: 'fetched', id: m.id, ok: false, status: 0, error: String((err && err.message) || err) }, HOME);
       }
     });
-    opener.postMessage({ tz: 'hello', href: location.href, host: location.host, html: document.documentElement.outerHTML, version: VERSION }, HOME);
-    say('Связь с помощником есть: скачиваю приказы этого сайта. Вкладка сама перейдёт к следующему региону, там снова нажмите закладку Tazalau.');
+    opener.postMessage({ tz: 'hello', href: location.href, host: location.host, version: VERSION }, HOME);
+    say('Связь с помощником есть: собираю приказы и объявления ДГД всех 20 регионов. Вкладку не закрывайте, ход сбора виден здесь и во вкладке tazalau.');
   }
 
   /* ======================= НАСТРОЙКИ ======================= */
@@ -1582,6 +1618,22 @@
     return out;
   }
 
+  /* ИИН из любого файла публикации: Word, Excel, страница (текст) или PDF и картинка (текст PDF, иначе скан) */
+  async function readOrderFile(bytes, name, type) {
+    const head = latin1(bytes.subarray(0, 64));
+    let kind = '';
+    if (head.startsWith('PK')) {
+      try { const names = zipRead(bytes).map(e => e.name); kind = names.includes('word/document.xml') ? 'docx' : names.some(n => /^xl\//.test(n)) ? 'xlsx' : ''; } catch (e) { kind = ''; }
+    } else if (/<(!doctype|html|table)/i.test(head) || /text\/html/i.test(type || '')) kind = 'html';
+    else if (/^\s*[\wЀ-ӿ"]/.test(head) && /text\/(plain|csv)/i.test(type || '')) kind = 'txt';
+    if (!kind) return readScan(bytes, name);
+    const parsed = await fileRows('файл.' + kind, bytes);
+    const ex = extractIins(parsed.rows), out = { iins: [], note: '', pages: 0 };
+    for (const x of ex.items) if (!out.iins.some(y => y.iin === x.iin)) out.iins.push({ iin: x.iin, conf: 'high', how: 'текст файла', fixes: 0 });
+    if (!out.iins.length) out.note = 'ИИН в файле не найден';
+    return out;
+  }
+
   /* ====================== Шаг 1: списки ДГД по регионам ====================== */
   /* Списки ДГД (финансовые управляющие) за день кладутся в подпапку «ДГД» рабочей папки: файл на регион, в любом
      из форматов xlsx, csv, docx, html, txt или PDF с текстом. Помощник находит в них ИИН (контрольная цифра и дата
@@ -1641,21 +1693,121 @@
   const NAME_RE = new RegExp('^[' + UP_ + '][' + UP_ + LO_ + '-]+(?:\\s+[' + UP_ + '](?:[' + UP_ + LO_ + '-]+|\\.)){1,3}$');
   const NAME_IN_TEXT = new RegExp('[' + UP_ + '][' + LO_ + '-]+(?:\\s+[' + UP_ + '][' + LO_ + '-]+){1,3}|[' + UP_ + ']{2,}(?:\\s+[' + UP_ + ']{2,}){1,3}', 'g');
 
-  /* ---------- сайты ДГД: меню, страницы приказов, строки приказов ---------- */
-  /* Сайты 20 регионов (один Drupal на всех). Порядок обхода: по алфавиту, города в конце. */
-  const KGD_SITES = [['abai', 'Абайская обл.'], ['akm', 'Акмолинская обл.'], ['akb', 'Актюбинская обл.'], ['alm', 'Алматинская обл.'],
-    ['atr', 'Атырауская обл.'], ['vko', 'Восточно-Казахстанская обл.'], ['zhmb', 'Жамбылская обл.'], ['zhts', 'Жетысуская обл.'],
-    ['zko', 'Западно-Казахстанская обл.'], ['krg', 'Карагандинская обл.'], ['kst', 'Костанайская обл.'], ['kzl', 'Кызылординская обл.'],
-    ['mng', 'Мангистауская обл.'], ['pvl', 'Павлодарская обл.'], ['sko', 'Северо-Казахстанская обл.'], ['trk', 'Туркестанская обл.'],
-    ['ult', 'Улытауская обл.'], ['astana', 'г. Астана'], ['almaty', 'г. Алматы'], ['shymkent', 'г. Шымкент']];
-  const KGD_START = '/ru/depsection/fizicheskim-licam';     /* раздел «Физическим лицам»: в его меню страницы приказов по годам */
-  const DGD_WINDOW = 31;                  /* приказы за столько дней скачиваются и читаются (старые только считаются) */
-  const DGD_SITE_STALE = 14;              /* последний приказ региона старше стольких дней: проверить */
-  const DGD_META = 'приказы_с_сайта.json';  /* в папке региона: что найдено на сайте при последнем сборе */
-  const DGD_OCR = 'распознано.json';       /* в папке «ДГД»: ИИН, прочитанные из файлов приказов (чтобы не читать заново) */
+  /* ---------- gov.kz: данные страницы (React Router, поток turbo-stream в тегах script) ---------- */
+  /* Страница gov.kz приходит с данными внутри: window.__reactRouterContext.streamController.enqueue("…"). Это плоский
+     массив значений, где объекты и массивы ссылаются на другие значения по номеру, а отложенные части (P12:[…])
+     дописываются в конец. Возвращает { имя запроса: { endpointName, arg, value } } (getFilteredData, getDocumentById…). */
+  function govData(html) {
+    let text = '';
+    for (const m of String(html).matchAll(/streamController\.enqueue\(("(?:[^"\\]|\\.)*")\)/g)) { try { text += JSON.parse(m[1]); } catch (e) { /* не JSON */ } }
+    const lines = text.split('\n').filter(l => l.trim());
+    if (!lines.length) return {};
+    let vals;
+    try { vals = JSON.parse(lines[0]); } catch (e) { return {}; }
+    if (!Array.isArray(vals)) return {};
+    const promises = {};
+    for (const l of lines.slice(1)) {
+      const m = /^([PE])(\d+):([\s\S]*)$/.exec(l);
+      if (!m) continue;
+      let arr;
+      try { arr = JSON.parse(m[3]); } catch (e) { continue; }
+      promises[m[2]] = vals.length;
+      for (const x of [].concat(arr)) vals.push(x);
+    }
+    const memo = new Map();
+    const dec = (i, depth) => {
+      if (typeof i !== 'number' || depth > 200) return null;
+      if (i < 0) return i === -4 ? 0 : null;
+      if (memo.has(i)) return memo.get(i);
+      const v = vals[i];
+      if (Array.isArray(v)) {
+        if (v.length && typeof v[0] === 'string' && v[0].length === 1 && 'DRSMYEPZBU'.includes(v[0])) {
+          const r = v[0] === 'P' ? (promises[v[1]] != null ? dec(promises[v[1]], depth + 1) : null) : v[0] === 'D' ? v[1] : null;
+          memo.set(i, r);
+          return r;
+        }
+        const r = [];
+        memo.set(i, r);
+        for (const x of v) r.push(dec(x, depth + 1));
+        return r;
+      }
+      if (v && typeof v === 'object') {
+        const r = {};
+        memo.set(i, r);
+        for (const [k, x] of Object.entries(v)) r[k[0] === '_' ? String(vals[+k.slice(1)]) : k] = dec(x, depth + 1);
+        return r;
+      }
+      memo.set(i, v);
+      return v;
+    };
+    const out = {}, seen = new Set();
+    const walk = (o, depth) => {
+      if (!o || typeof o !== 'object' || seen.has(o) || depth > 60) return;
+      seen.add(o);
+      if (!Array.isArray(o) && typeof o.endpointName === 'string' && !out[o.endpointName]) out[o.endpointName] = o;
+      for (const x of Array.isArray(o) ? o : Object.values(o)) walk(x, depth + 1);
+    };
+    walk(dec(0, 0), 0);
+    return out;
+  }
+
+  /* ---------- ДГД на gov.kz: 20 регионов, публикации о банкротстве граждан ---------- */
+  /* Адреса департаментов на gov.kz (проверено 20.11.2026: все 20 открываются, у каждого раздел «Документы»). */
+  const GOV_SITES = [['kgd-abay', 'Абайская обл.'], ['kgd-akmola', 'Акмолинская обл.'], ['kgd-aktobe', 'Актюбинская обл.'],
+    ['kgd-alm', 'Алматинская обл.'], ['kgd-atyrau', 'Атырауская обл.'], ['kgd-vko', 'Восточно-Казахстанская обл.'],
+    ['kgd-zhambyl', 'Жамбылская обл.'], ['kgd-zhetysu', 'Жетысуская обл.'], ['kgd-zko', 'Западно-Казахстанская обл.'],
+    ['kgd-karaganda', 'Карагандинская обл.'], ['kgd-kostanay', 'Костанайская обл.'], ['kgd-kyzylorda', 'Кызылординская обл.'],
+    ['kgd-mangistau', 'Мангистауская обл.'], ['kgd-pavlodar', 'Павлодарская обл.'], ['kgd-sko', 'Северо-Казахстанская обл.'],
+    ['kgd-turkistan', 'Туркестанская обл.'], ['kgd-ulytau', 'Улытауская обл.'], ['kgd-astana', 'г. Астана'],
+    ['kgd-almaty', 'г. Алматы'], ['kgd-shymkent', 'г. Шымкент']];
+  const GOV = 'https://www.gov.kz';
+  const GOV_START = GOV + '/org/kgd-almaty/documents/1?lang=ru';
+  const GOV_PAGES = 12;                   /* страниц списка документов (по 50) на регион, не больше */
+  const DGD_WINDOW = 31;                  /* публикации за столько дней скачиваются и читаются */
+  const DGD_SITE_STALE = 14;              /* последняя публикация региона старше стольких дней: проверить */
+  const DGD_META = 'публикации_gov_kz.json';   /* в папке региона: что найдено на gov.kz при последнем сборе */
+  const DGD_OCR = 'распознано.json';       /* в папке «ДГД»: ИИН, прочитанные из файлов (чтобы не читать заново) */
   const regionFolder = name => name.replace(/ обл\.$/, ' область');   /* Windows не разрешает точку в конце имени папки */
-  const ORDER_PAGE_RE = rx('приказ\\S*\\s.*?(?:назнач|отстран|освобожд).*?финансов\\S*\\s+управляющ');
-  const NOT_CITIZEN_RE = rx('реабилитац|банкротн\\S*\\s+(?:и\\s+)?управляющ|временн\\S*\\s+управляющ|<<список|<<реестр|объявлени');
+  /* Публикации о процедурах граждан: приказы о финансовых управляющих, объявления о возбуждении дела (судебное банкротство,
+     восстановление платежеспособности), о признании банкротом, реестры требований кредиторов (РТК) по должнику.
+     Не берутся: юрлица (ТОО, АО, реабилитация, банкротный и временный управляющий, ликвидация), списки управляющих,
+     уведомления управляющих о начале деятельности, конкурсы и прочее. */
+  const GOV_DOC_RE = rx('финансов\\S*\\s+управляющ|граждан|физическ\\S*\\s+лиц|физ\\.?\\s*лиц|<<фл>>|платежеспособ|судебн\\S*\\s+банкротств|<<ртк>>|' +
+    'реестр\\S*\\s+требовани|борышкер|<<должник|төлем\\s+қабілет|азаматтар');
+  /* Название публикации: только ФИО человека (так Костанай называет объявления и реестры по гражданам) */
+  const PERSON_TITLE_RE = new RegExp('^[«"]?(?:[' + UP_ + '][' + LO_ + 'ʼ’\'-]+(?:\\s+[' + UP_ + '][' + LO_ + 'ʼ’\'-]+){1,3}|[' + UP_ + ']{2,}(?:\\s+[' + UP_ + ']{2,}){1,3})[»"]?$');
+  const isGovCitizenDoc = t => (GOV_DOC_RE.test(t) || PERSON_TITLE_RE.test(clean(t))) && !GOV_NOT_RE.test(t);
+  /* Сводная публикация за год («Информационные сообщения ФЛ 2026», «Приказы … 2026 год»): файлы в ней дополняют, поэтому
+     она перечитывается при каждом сборе, пока идёт этот год */
+  const govYearly = t => new RegExp('(?:^|\\D)' + new Date().getFullYear() + '(?:\\D|$)').test(t) && /сообщени|приказы|хабарлам|бұйрықтар/i.test(t);
+  const GOV_NOT_RE = rx('реабилитац|банкротн\\S*\\s+управляющ|временн\\S*\\s+управляющ|<<тоо>>|<<ао>>|товариществ|<<llp>>|ликвидац|оценщик|' +
+    'конкурс|ваканс|список\\s+(?:лиц|финансов|администратор)|сведени\\S*\\s+о\\s+направленн|собрани\\S*\\s+кредитор|<<ип>>');
+  const UPPER_NAME = '[' + UP_ + ']{2,}(?:[\\s-]+[' + UP_ + ']{2,}){1,3}';
+  function govKind(title) {
+    const t = String(title || ''), low = t.toLowerCase();
+    const proc = /восстановлени\S*\s+платежеспособ|(?:^|\s)вп(?:\s|$)|төлем\s+қабілет/i.test(low) ? 'восстановление платежеспособности'
+      : /судебн\S*\s+банкрот|(?:^|\s)сб(?:\s|$)/i.test(low) ? 'судебное банкротство' : '';
+    let kind = 'публикация';
+    if (/приказ|бұйрық/.test(low)) { const k = orderInfo([t], []).kind; kind = 'приказ' + (k ? ' (' + k + ')' : ''); }
+    else if (/(?:^|\s)ртк(?:\s|$)|реестр\S*\s+требовани/.test(low)) kind = 'реестр требований кредиторов';
+    else if (/объявлени\S*\s+о\s+возбуждени/.test(low)) kind = 'объявление о возбуждении дела';
+    else if (/объявлени\S*\s+о\s+признани/.test(low)) kind = 'объявление о признании банкротом';
+    else if (/объявлени\S*\s+о\s+(?:применени|завершени|прекращени)/.test(low)) kind = 'объявление о ' + /о\s+(\S+)/.exec(low.slice(low.indexOf('объявлени')))[1].replace(/и$/, 'и процедуры');
+    return proc && kind !== 'публикация' ? kind + ', ' + proc : kind;
+  }
+  /* ФИО должника из названия публикации: «РТК должник ФАМИЛИЯ ИМЯ», «по заявлению должника …», «… ВП Фамилия И.» */
+  function govDebtor(title) {
+    const t = clean(title);
+    if (PERSON_TITLE_RE.test(t)) return t.replace(/[«»"]/g, '');
+    for (const re of [new RegExp('(?:должник\\S*|борышкер)\\s+[«"]?(' + UPPER_NAME + '|' + NAME_ANY + ')'), new RegExp('(?:^|\\s)(?:ВП|СБ)\\s+(' + UPPER_NAME + '|' + NAME_ANY + ')')]) {
+      const m = re.exec(t);
+      if (m) return clean(m[1]);
+    }
+    const o = orderInfo([t], []);
+    if (o.debtor) return o.debtor;
+    const tail = new RegExp('(' + UPPER_NAME + '|' + N1 + '\\s+' + N1 + '(?:\\s+' + N1 + ')?)\\s*$').exec(t.replace(/[.,;)»"]+$/, ''));
+    return tail && !/^(Республики|Казахстан)/.test(tail[1]) ? clean(tail[1]) : '';
+  }
   const N1 = '[' + UP_ + '][' + LO_ + 'ʼ’\'-]+', INI = '[' + UP_ + ']\\.\\s*(?:[' + UP_ + ']\\.?)?';
   const NAME_ANY = N1 + '\\s+' + INI + '|' + N1 + '(?:\\s+' + N1 + '){1,3}';
   const NAME_ONLY = new RegExp('^[«"]?(?:' + NAME_ANY + ')[»"]?$');
@@ -1663,65 +1815,6 @@
   const DEBTOR_RES = [AFTER('[Пп]о\\s+заявлени\\S*\\s+(?:должник\\S*\\s+|гражданин\\S*\\s+|гр\\.\\s*|ФЛ\\s+)?'),
     AFTER('[Вв]\\s+отношении\\s+(?:ФЛ\\s+|физическ\\S+\\s+лиц\\S*\\s+|гражданин\\S*\\s+|должник\\S*\\s+)?'), AFTER('(?:^|\\s)ФЛ\\s+')];
   const MANAGER_RE = AFTER('финансов\\S*\\s+управляющ\\S*\\s+');
-  /* Страницы приказов из меню сайта: [{ url, title, year }]. Страница узнаётся по названию пункта меню или по адресу
-     (у Костаная пункт назван «…реабилитационных, банкротных управляющих», а адрес и содержание: финансовые управляющие).
-     Год из меню («2026 год. …») только для справки: меню у регионов устроены по-разному, поэтому читаются все такие
-     страницы, а свежесть решают даты самих приказов. */
-  const ORDER_SLUG_RE = /prikaz\S*(?:naznach|otstran|osvobozh)\S*finansov\S*upravl/i;
-  function orderPages(html, base) {
-    const doc = new DOMParser().parseFromString(html, 'text/html'), out = [];
-    let year = null;
-    for (const a of doc.querySelectorAll('a[href]')) {
-      if (a.closest('.field-name-body, .node .content, article .content')) continue;     /* ссылки внутри таблицы приказов: это файлы */
-      const t = clean(a.textContent);
-      let u;
-      try { u = new URL(a.getAttribute('href'), base); } catch (e) { continue; }
-      if (!/kgd\.gov\.kz$/i.test(u.hostname) || /\/sites\/default\/files\/|\.(pdf|jpe?g|png|tiff?|docx?|xlsx?|zip|rar)$/i.test(u.pathname)) continue;
-      const y = /(20\d\d)\s*(?:год|жыл)/i.exec(t);
-      const byText = ORDER_PAGE_RE.test(t) && !NOT_CITIZEN_RE.test(t), bySlug = ORDER_SLUG_RE.test(u.pathname);
-      if (!byText && !bySlug) {
-        if (y) year = +y[1];
-        else if (/восстановлени\S*\s+платежеспособ|банкрот/i.test(t)) year = null;            /* раздел без года */
-        continue;
-      }
-      const href = new URL(u.pathname, base).href;                     /* на тот же сайт, где открыто окно */
-      const own = y ? +y[1] : year;
-      const old = out.find(p => p.url === href);
-      if (old) { if (!old.year && own) old.year = own; continue; }
-      out.push({ url: href, title: t.slice(0, 200), year: own });
-    }
-    return out.slice(0, 8);
-  }
-  /* Строки страницы приказов: [{ text, cells, files: [{ url, gov, name }], date, kind, debtor, manager, number }] */
-  function orderRows(html, pageUrl) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const box = doc.querySelector('.field-name-body') || doc.querySelector('.node .content') || doc.querySelector('article') || doc.querySelector('#content') || doc.body;
-    if (!box) return [];
-    let blocks = Array.from(box.querySelectorAll('tr'));
-    if (!blocks.length) blocks = Array.from(box.querySelectorAll('p, li')).filter(e => e.querySelector('a[href]'));
-    const out = [];
-    for (const el of blocks) {
-      const cells = el.tagName === 'TR' ? Array.from(el.children).map(c => clean(c.textContent)) : [clean(el.textContent)];
-      const files = [];
-      for (const a of el.querySelectorAll('a[href]')) {
-        let u;
-        try { u = new URL(a.getAttribute('href'), pageUrl); } catch (e) { continue; }
-        const gov = /(^|\.)gov\.kz$/i.test(u.hostname) && !/kgd\.gov\.kz$/i.test(u.hostname) && /documents|uploads|assets/i.test(u.pathname);
-        const file = /kgd\.gov\.kz$/i.test(u.hostname) && (/\/sites\/default\/files\//i.test(u.pathname) || /\.(pdf|jpe?g|png|tiff?|docx?|zip|rar)$/i.test(u.pathname));
-        if (!file && !gov) continue;
-        if (file) u = new URL(u.pathname, pageUrl);                     /* файл с того же сайта, где открыто окно */
-        if (!files.some(f => f.url === u.href)) {
-          let name = u.pathname.split('/').pop() || '';
-          try { name = decodeURIComponent(name); } catch (e) { /* имя как есть */ }
-          files.push({ url: u.href, gov, name });
-        }
-      }
-      const text = clean(cells.filter(Boolean).join(' | '));
-      if (!files.length && !/\d{1,2}\.\d{1,2}\.\d{2,4}/.test(text)) continue;        /* заголовок или пустая строка */
-      out.push(Object.assign({ text: text.slice(0, 400), cells, files }, orderInfo(cells, files)));
-    }
-    return out;
-  }
   function orderInfo(cells, files) {
     const today = new Date();
     const text = cells.join(' '), dates = [];
@@ -1866,7 +1959,7 @@
     return { items, invalid };
   }
 
-  /* Все файлы подпапки «ДГД» (и её подпапок): приказы, собранные с сайтов (в папке региона файл DGD_META), и файлы,
+  /* Все файлы подпапки «ДГД» (и её подпапок): публикации, собранные с gov.kz (в папке региона файл DGD_META), и файлы,
      положенные вручную (списки xlsx, csv, docx, html, PDF, сканы). ИИН из сканов читаются один раз и запоминаются
      в «ДГД/распознано.json». */
   async function readDgd(dir) {
@@ -1890,7 +1983,7 @@
       const file = await handle.getFile();
       const hit = cache[key];
       if (hit && hit.size === file.size && Array.isArray(hit.iins)) return hit;
-      const r = await readScan(new Uint8Array(await file.arrayBuffer()), name);
+      const r = await readOrderFile(new Uint8Array(await file.arrayBuffer()), name, '');
       cache[key] = { size: file.size, at: new Date().toISOString(), note: r.note || '', iins: r.iins.map(x => ({ iin: x.iin, conf: x.conf, how: x.how, fixes: x.fixes || 0 })) };
       cacheChanged = true;
       return cache[key];
@@ -1904,7 +1997,7 @@
       for (const r of meta.rows || []) {
         const row = { region, date: r.date ? new Date(r.date + 'T00:00:00') : null, dateFrom: r.dateFrom || '', kind: r.kind || '', debtor: r.debtor || '',
           manager: r.manager || '', number: r.number || '', text: r.text || '', page: r.page || '', future: !!r.future, firstSeen: r.firstSeen || '',
-          files: [], iins: [], gov: (r.files || []).some(f => f.gov), notes: [] };
+          files: [], iins: [], gov: (r.files || []).some(f => f.gov), notes: [].concat(r.notes || []) };
         for (const f of r.files || []) {
           const file = { url: f.url, name: f.name, gov: !!f.gov, saved: f.saved || '', err: f.err || '', path: '' };
           row.files.push(file);
@@ -1921,8 +2014,7 @@
         out.orders.push(row);
         for (const x of row.iins) {
           out.items.push({ iin: x.iin, fio: row.debtor, mgr: row.manager, date: row.date, listDate: row.date, region, path: x.path, kind: row.kind,
-            conf: x.conf, how: x.how, page: row.page, where: 'приказ' + (row.kind ? ' о ' + ({ 'назначение': 'назначении', 'отстранение': 'отстранении', 'освобождение': 'освобождении' }[row.kind] || row.kind) : '') +
-              (row.number ? ' № ' + row.number : '') + (row.date ? ' от ' + dmy(row.date) : '') });
+            conf: x.conf, how: x.how, page: row.page, where: (row.kind || 'публикация') + (row.number ? ' № ' + row.number : '') + (row.date ? ' от ' + dmy(row.date) : '') });
         }
       }
       out.sites.push(site);
@@ -2000,22 +2092,20 @@
         if (site.state === 'skip') bad('сайт не открылся' + (site.rows.length ? '; приказы с прошлого сбора' + when : ''));
         else if (site.state !== 'ok') bad((site.note || 'сбор не удался') + (site.rows.length ? '; приказы с прошлого сбора' + when : ''));
         if (site.state !== 'ok') { /* причина уже названа */ }
-        else if (!site.pages.length) bad('на сайте не найдена страница приказов');
-        else if (!site.pages.some(p => p.read)) bad('страницы приказов не открылись');
-        else if (!site.rows.length) bad('на страницах приказов нет строк');
-        else if (!win.length) bad('0 приказов за ' + (site.window || DGD_WINDOW) + ' дн.');
-        else if (win.length <= DGD_FEW) warn('всего ' + win.length + ' приказ' + (win.length === 1 ? '' : 'а') + ' за ' + (site.window || DGD_WINDOW) + ' дн.: проверить на сайте');
-        if (last && days(last) > DGD_SITE_STALE) warn('последний приказ ' + dmy(last) + ': ' + days(last) + ' дн. назад');
-        if (r.unread) warn('ИИН не прочитан в приказах: ' + r.unread + ' (открыть файл, сверить вручную)');
+        else if (!site.pages.some(p => p.read)) bad('раздел «Документы» на gov.kz не открылся');
+        else if (!win.length) bad('0 публикаций за ' + (site.window || DGD_WINDOW) + ' дн.');
+        else if (win.length <= DGD_FEW) warn('всего ' + win.length + ' публикаци' + (win.length === 1 ? 'я' : 'и') + ' за ' + (site.window || DGD_WINDOW) + ' дн.: проверить на gov.kz');
+        if (last && days(last) > DGD_SITE_STALE) warn('последняя публикация ' + dmy(last) + ': ' + days(last) + ' дн. назад');
+        if (r.unread) warn('ИИН не прочитан в публикациях: ' + r.unread + ' (открыть файл, сверить вручную)');
+        const nofile = win.filter(x => !x.files.some(f => f.saved)).length;
+        if (nofile) warn('без файла: ' + nofile + ' (открыть публикацию на gov.kz)');
         const doubt = win.filter(x => x.iins.some(y => y.conf !== 'high')).length;
         if (doubt) warn('ИИН прочитан неуверенно: ' + doubt + ' (сверить с приказом)');
-        const gov = win.filter(x => x.gov && !x.files.some(f => f.saved)).length;
-        if (gov) warn('приказы на gov.kz: ' + gov + ' (скачать вручную в папку региона)');
         const undated = site.rows.filter(x => !x.date).length;
         if (undated) warn('строк без даты: ' + undated);
         const future = site.rows.filter(x => x.future).length;
         if (future) warn('дата приказа в будущем: ' + future);
-        if (site.state === 'ok' && site.rows.length && !year.length && today.getMonth() > 0) warn('приказов за ' + today.getFullYear() + ' год на сайте нет');
+        if (site.state === 'ok' && site.rows.length && !year.length && today.getMonth() > 0) warn('публикаций за ' + today.getFullYear() + ' год на gov.kz нет');
       }
       if (files.length || !site) {
         const newest = maxDate([listDate, lastDate]);
@@ -2041,21 +2131,21 @@
   async function dgdWorkbook(dg) {
     const lvl = { bad: STYLE.bad, warn: STYLE.warn, good: STYLE.good };
     const link = (v, to) => (to ? { v, link: to } : v);
-    const regionRows = [['Регион', 'Проверка', 'Сайт ДГД: сбор', 'Последний приказ', 'Приказов за ' + DGD_WINDOW + ' дн.', 'Приказов за год', 'ИИН прочитан',
-      'ИИН не прочитан', 'Файлов вручную', 'Уникальных ИИН', 'Неверных ИИН', 'Дата списка (файлы)', 'Страницы приказов на сайте', 'Файлы']]
+    const regionRows = [['Регион', 'Проверка', 'gov.kz: сбор', 'Последняя публикация', 'Публикаций за ' + DGD_WINDOW + ' дн.', 'Публикаций за год', 'ИИН прочитан',
+      'ИИН не прочитан', 'Файлов вручную', 'Уникальных ИИН', 'Неверных ИИН', 'Дата списка (файлы)', 'Раздел «Документы» на gov.kz', 'Файлы']]
       .concat(dg.regions.map(r => [r.name, { v: r.text, s: lvl[r.level] },
         r.site ? (r.site.state === 'ok' ? dmy(r.site.collectedAt) : 'не открылся ' + dmy(r.site.failedAt || r.site.collectedAt)) : 'нет',
         dmy(r.lastOrder), r.site ? String(r.win) : '', r.site ? String(r.year) : '', r.site ? String(r.read) : '', r.site ? String(r.unread) : '',
         String(r.files.length), String(r.unique), String(r.invalid), dmy(r.listDate),
-        r.site ? r.site.pages.map(p => (p.year ? p.year + ': ' : '') + p.url).join('\n') : '', r.files.map(f => f.path).join('; ')]));
+        r.site ? (r.site.pages[0] ? r.site.pages[0].url.replace(/\/documents\/\d+\?.*$/, '/documents/1?lang=ru') : '') : '', r.files.map(f => f.path).join('; ')]));
     const conf = x => (x.conf === 'high' || !x.conf ? '' : ' (сверить)');
-    const orderRowsOut = [['Регион', 'Дата приказа', 'Вид', 'Должник (как на сайте)', 'Финансовый управляющий', 'ИИН', 'Как прочитан ИИН', 'Файл приказа', 'Страница на сайте', 'Впервые увиден']]
+    const orderRowsOut = [['Регион', 'Дата публикации', 'Вид', 'Должник (как в названии)', 'Финансовый управляющий', 'ИИН', 'Как прочитан ИИН', 'Файл', 'Публикация на gov.kz', 'Впервые увиден', 'Название публикации']]
       .concat((dg.orders || []).slice().sort((a, b) => (b.date || 0) - (a.date || 0)).map(o => {
         const f = o.files.find(x => x.saved) || o.files[0] || {};
         return [o.region, dmy(o.date) + (o.dateFrom ? ' (' + o.dateFrom + ')' : ''), o.kind, o.debtor, o.manager,
           o.iins.length ? { v: o.iins.map(x => x.iin).join(', '), s: o.iins.some(x => x.conf !== 'high') ? STYLE.warn : 0 } : (f.saved ? { v: 'не прочитан', s: STYLE.warn } : ''),
-          o.iins.map(x => x.how + conf(x)).join('; ') || o.notes.join('; ') || (f.gov ? 'файл на gov.kz' : f.err || (f.saved ? '' : 'файл не скачивался (старше ' + DGD_WINDOW + ' дн.)')),
-          f.saved ? link(f.path.slice(DGD_DIR.length + 1), f.path) : link(f.url || '', f.url), link(o.page, o.page), o.firstSeen];
+          o.iins.map(x => x.how + conf(x)).join('; ') || o.notes.join('; ') || f.err || (f.saved ? '' : o.date && (new Date() - o.date) / 86400000 > DGD_WINDOW ? 'файл не скачивался (старше ' + DGD_WINDOW + ' дн.)' : 'файла нет'),
+          f.saved ? link(f.path.slice(DGD_DIR.length + 1), f.path) : link(f.url || '', f.url), link(o.page, o.page), o.firstSeen, o.text];
       }));
     const iinRows = [['ИИН', 'ФИО в списке', 'Регион', 'Дата в строке', 'Финансовый управляющий', 'Дата списка', 'Файл', 'Где в файле']]
       .concat(dg.items.map(x => [x.iin, x.fio, x.region || 'не определён', dmy(x.date), x.mgr, dmy(x.listDate), { v: x.path, link: x.path }, x.where + conf(x)]));
@@ -2065,7 +2155,7 @@
           s: f.failed || (f.note && !/распознан$/.test(f.note)) ? STYLE.warn : 0 }]));
     return makeXlsx([
       { name: 'Регионы', rows: regionRows, widths: [30, 60, 16, 14, 12, 12, 11, 12, 10, 12, 11, 14, 70, 50] },
-      { name: 'Приказы', rows: orderRowsOut, widths: [26, 14, 14, 36, 32, 15, 26, 46, 50, 12] },
+      { name: 'Публикации', rows: orderRowsOut, widths: [26, 14, 30, 34, 30, 15, 26, 46, 50, 12, 70] },
       { name: 'ИИН', rows: iinRows, widths: [15, 36, 28, 14, 36, 13, 40, 30] },
       { name: 'Файлы', rows: fileRowsOut, widths: [44, 28, 10, 13, 13, 16, 14, 70] },
     ]);
@@ -2169,14 +2259,14 @@
   /* ИИН из списков ДГД готовым списком для SQL (шаг 2: выгрузка ADW только по этим ИИН) */
   const sqlB = button('ИИН для SQL ⧉', copySql, false, 'Скопировать ИИН из списков ДГД в виде VALUES (...) для запроса к ADW');
   dgdDetails.append(dgdHead, dgdList);
-  /* Сбор приказов с сайтов ДГД 20 регионов: окно сайта + закладка в нём (см. relay) */
-  const collectB = button('🌐 Собрать ДГД с сайтов', () => collectDgd(), true,
-    'Помощник по очереди откроет сайты ДГД 20 регионов, скачает приказы о финансовых управляющих за ' + DGD_WINDOW +
-    ' дней в подпапку «' + DGD_DIR + '» и прочитает в них ИИН. В каждом окне сайта нажмите закладку Tazalau.');
+  /* Сбор публикаций ДГД 20 регионов с gov.kz: вкладка gov.kz + закладка в ней (см. relay) */
+  const collectB = button('🌐 Собрать ДГД с gov.kz', () => collectDgd(), true,
+    'Помощник откроет вкладку gov.kz: нажмите в ней закладку Tazalau один раз. Он соберёт публикации ДГД всех 20 регионов о процедурах граждан ' +
+    '(приказы о финансовых управляющих, объявления о возбуждении дел, реестры требований) за ' + DGD_WINDOW + ' дней в подпапку «' + DGD_DIR + '» и прочитает ИИН.');
   const collectBox = h('div', 'display:none;white-space:pre-line;max-height:240px;overflow:auto;margin:2px 0 4px;padding:4px 6px;' +
     'background:#fff;border:1px solid #d5dbe5;border-radius:4px;font-size:12px');
   collectBox.id = 'tazalau-collect';
-  const skipB = button('Пропустить регион', () => skipSite(), false, 'Сайт этого региона не открывается: отметить его и перейти к следующему');
+  const skipB = button('Пропустить регион', () => skipSite(), false, 'Регион долго не отвечает: бросить его и перейти к следующему');
   const stopCollectB = button('Закончить сбор', () => finishCollect('остановлено'), false, 'Остановить сбор: всё собранное сохранится');
   const collectCtl = row(skipB, stopCollectB);
   collectCtl.style.display = 'none';
@@ -2373,7 +2463,7 @@
     if (dgd === 'reading') { dgdHead.textContent = 'ДГД: читаю списки…'; dgdList.textContent = ''; return; }
     if (!dgd) {
       dgdHead.textContent = 'ДГД: подпапки «' + DGD_DIR + '» нет';
-      dgdList.textContent = 'Нажмите «Собрать ДГД с сайтов»: помощник сам скачает приказы о финансовых управляющих всех 20 регионов в подпапку «' +
+      dgdList.textContent = 'Нажмите «Собрать ДГД с gov.kz»: помощник сам соберёт публикации ДГД всех 20 регионов о процедурах граждан в подпапку «' +
         DGD_DIR + '» и прочитает ИИН. Списки, скачанные вручную, тоже можно положить в «' + DGD_DIR + '»: файл на регион, в имени регион и дата.';
       return;
     }
@@ -2450,7 +2540,7 @@
         if (maybe.length) {
           const o = maybe[0], f = o.files.find(x => x.saved) || o.files[0] || {};
           const cur = (S.cells.get(t.row) || new Map()).get(L.dgdCol);
-          setText(S, t.row, L.dgdCol, ('⚠ возможно (по ФИО, ИИН в приказе не прочитан): ' + maybe.map(m => m.region + ', «' + m.debtor + '», приказ' +
+          setText(S, t.row, L.dgdCol, ('⚠ возможно (по ФИО, ИИН в файле не прочитан): ' + maybe.map(m => m.region + ', «' + m.debtor + '», ' + (m.kind || 'публикация') +
             (m.date ? ' от ' + dmy(m.date) : '') + (m.manager ? ', управляющий: ' + m.manager : '')).join('; ')).slice(0, 32000),
             f.path || f.url ? await linkStyle(S, cur ? cur.getAttribute('s') : null) : null);
           if (f.path || f.url) await setLink(S, t.row, L.dgdCol, f.path || f.url);
@@ -2477,26 +2567,24 @@
     }
     return marked;
   }
-  /* ---------- сбор с сайтов ДГД ---------- */
+  /* ---------- сбор с gov.kz: одна вкладка gov.kz, закладка в ней нажимается один раз ---------- */
   let collect = null;                  /* идёт сбор: { sites, popup, origin, pending, seq, cur, ocr, cache, … } */
   async function readJsonFile(dir, name) {
-    try { return JSON.parse((await (await (await dir.getFileHandle(name)).getFile()).text()).replace(/^\ufeff/, '')); } catch (e) { return null; }
+    try { return JSON.parse((await (await (await dir.getFileHandle(name)).getFile()).text()).replace(/^﻿/, '')); } catch (e) { return null; }
   }
   async function writeJsonFile(dir, name, obj) { await writeFile(dir, name, new Blob([JSON.stringify(obj, null, 1)], { type: 'application/json' })); }
   const isoDay = d => (d ? d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) : '');
-  const siteUrl = s => 'https://' + s.host + (s.start || KGD_START);
+  const dayOf = v => { const d = new Date(v); return isNaN(d) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate()); };
   function collectDgd() {
     if (running) return;
-    if (!store.dir) { say('Сначала выберите папку (📁 Папка с Excel): в её подпапку «' + DGD_DIR + '» помощник сложит приказы ДГД.'); return; }
-    if (collect) { try { collect.popup.focus(); } catch (e) { /* окно закрыто */ } return; }
-    const sites = KGD_SITES.map(([key, name]) => ({ key, name, host: key + '.kgd.gov.kz', state: 'wait', note: '', got: null }));
-    /* Сайт открывается сразу по нажатию кнопки (иначе браузер заблокирует) в новой обычной вкладке: в ней видна панель
-       закладок (у всплывающего окна её нет, и нажать закладку было бы нечем) */
-    const popup = window.open(siteUrl(sites[0]), 'tazalau_dgd');
-    if (!popup) { say('❌ Браузер не дал открыть вкладку сайта ДГД. Разрешите всплывающие окна для tazalau.qoldau.kz (значок справа в адресной строке) и нажмите кнопку ещё раз.'); return; }
-    collect = { sites, popup, origin: '', pending: new Map(), seq: 0, cur: sites[0], ocr: Promise.resolve(), ocrLeft: 0, cache: null, started: new Date() };
-    sites[0].state = 'open';
-    collect.watch = setInterval(() => { if (collect && collect.popup && collect.popup.closed && !collect.finishing) finishCollect('окно сайта закрыто'); }, 1500);
+    if (!store.dir) { say('Сначала выберите папку (📁 Папка с Excel): в её подпапку «' + DGD_DIR + '» помощник сложит приказы и объявления ДГД.'); return; }
+    if (collect) { try { collect.popup.focus(); } catch (e) { /* вкладка закрыта */ } return; }
+    /* Вкладка gov.kz открывается сразу по нажатию кнопки (иначе браузер её заблокирует); это обычная вкладка с панелью закладок */
+    const popup = window.open(GOV_START, 'tazalau_dgd');
+    if (!popup) { say('❌ Браузер не дал открыть вкладку gov.kz. Разрешите всплывающие окна для tazalau.qoldau.kz (значок справа в адресной строке) и нажмите кнопку ещё раз.'); return; }
+    const sites = GOV_SITES.map(([slug, name]) => ({ slug, key: slug, name, state: 'wait', note: '' }));
+    collect = { sites, popup, origin: '', pending: new Map(), seq: 0, cur: null, ocr: Promise.resolve(), ocrLeft: 0, cache: null, started: new Date(), connected: false };
+    collect.watch = setInterval(() => { if (collect && collect.popup && collect.popup.closed && !collect.finishing) finishCollect('вкладка gov.kz закрыта'); }, 1500);
     showCollect();
     updateButtons();
   }
@@ -2507,185 +2595,176 @@
     if (!c && !final) { collectBox.style.display = 'none'; return; }
     collectBox.style.display = 'block';
     if (final) { collectBox.textContent = final; return; }
-    const icon = { wait: '·', open: '⏳', work: '⏬', done: '✔', fail: '❌', skip: '⏭' };
-    const lines = c.sites.map(s => icon[s.state] + ' ' + s.name + (s.state === 'open' ? ': во вкладке сайта нажмите закладку Tazalau' : s.note ? ': ' + s.note : ''));
+    if (!c.connected) { collectBox.textContent = 'Открыта вкладка gov.kz: нажмите в ней закладку Tazalau ▶ (один раз). Дальше помощник соберёт все 20 регионов сам.'; return; }
+    const icon = { wait: '·', work: '⏬', done: '✔', fail: '❌', skip: '⏭' };
+    const lines = c.sites.map(s => icon[s.state] + ' ' + s.name + (s.note ? ': ' + s.note : ''));
     const done = c.sites.filter(s => /done|fail|skip/.test(s.state)).length;
-    collectBox.textContent = 'Сбор ДГД: ' + done + ' из ' + c.sites.length + (c.ocrLeft ? ' · читаю ИИН: ' + c.ocrLeft : '') + '\n' + lines.join('\n');
+    collectBox.textContent = 'Сбор ДГД с gov.kz: ' + done + ' из ' + c.sites.length + (c.ocrLeft ? ' · читаю ИИН: ' + c.ocrLeft : '') + '\n' + lines.join('\n');
   }
-  function tell(text) { try { if (collect && collect.origin) collect.popup.postMessage({ tz: 'say', text }, collect.origin); } catch (e) { /* окно закрыто */ } }
-  function relayFetch(url, ms, method) {
+  function tell(text) { try { if (collect && collect.origin) collect.popup.postMessage({ tz: 'say', text }, collect.origin); } catch (e) { /* вкладка закрыта */ } }
+  function relayAsk(msg, ms) {
     const c = collect;
     return new Promise((resolve, reject) => {
       if (!c || c.finishing) { reject(new Error('сбор остановлен')); return; }
       const id = ++c.seq;
-      const t = setTimeout(() => { c.pending.delete(id); reject(new Error('окно сайта не ответило')); }, ms || 90000);
+      const t = setTimeout(() => { c.pending.delete(id); reject(new Error('вкладка gov.kz не ответила')); }, ms || 90000);
       c.pending.set(id, m => { clearTimeout(t); resolve(m); });
-      try { c.popup.postMessage({ tz: 'fetch', id, url, method: method || 'GET' }, c.origin); } catch (e) { clearTimeout(t); c.pending.delete(id); reject(e); }
+      try { c.popup.postMessage(Object.assign({ id }, msg), c.origin); } catch (e) { clearTimeout(t); c.pending.delete(id); reject(e); }
     });
   }
+  const relayFetch = (url, ms, method) => relayAsk({ tz: 'fetch', url, method: method || 'GET' }, ms);
+  const relayFrame = (url, wait) => relayAsk({ tz: 'frame', url, wait: wait || 25000 }, (wait || 25000) + 20000);
   function onRelay(e) {
     const c = collect, m = e.data;
     if (!c || !m || typeof m.tz !== 'string' || e.source !== c.popup) return;
-    if (!/^https:\/\/([a-z0-9-]+\.)*kgd\.gov\.kz$/i.test(e.origin)) return;
+    if (!/^https:\/\/(www\.)?gov\.kz$/i.test(e.origin)) return;
     if (m.tz === 'fetched') { const p = c.pending.get(m.id); if (p) { c.pending.delete(m.id); p(m); } return; }
-    if (m.tz === 'hello') siteHello(e.origin, m);
+    if (m.tz === 'hello' && !c.connected) { c.origin = e.origin; c.connected = true; harvestAll(); }
   }
   window.addEventListener('message', onRelay);
-  async function siteHello(origin, m) {
+  async function harvestAll() {
     const c = collect;
-    const key = new URL(origin).hostname.replace(/^www\./, '').split('.')[0];
-    const s = c.sites.find(x => x.key === key);
-    if (!s) { c.origin = origin; tell('Этот сайт не из списка 20 регионов. Окно перейдёт к нужному сайту.'); openNext(); return; }
-    if (s.state === 'work') return;                      /* закладку нажали второй раз */
-    c.origin = origin;
-    c.cur = s;
-    s.state = 'work';
-    s.note = 'скачиваю';
     showCollect();
-    try { await harvest(s, m); s.state = 'done'; }
-    catch (err) { s.state = 'fail'; s.note = (err && err.message) || String(err); await saveSiteFail(s); }
-    showCollect();
-    if (collect === c && !c.finishing) openNext();
-  }
-  function openNext() {
-    const c = collect;
-    const next = c.sites.find(x => x.state === 'wait');
-    if (!next) { finishCollect(''); return; }
-    next.state = 'open';
-    c.cur = next;
-    c.origin = '';
-    try { c.popup.location.href = siteUrl(next); } catch (e) { finishCollect('окно сайта закрыто'); return; }
-    showCollect();
+    for (const s of c.sites) {
+      if (collect !== c || c.finishing) return;
+      c.cur = s;
+      s.state = 'work';
+      s.note = 'читаю список публикаций';
+      showCollect();
+      try { await harvestGov(s); s.state = 'done'; }
+      catch (err) { s.state = 'fail'; s.note = (err && err.message) || String(err); await saveSiteFail(s); }
+      showCollect();
+    }
+    if (collect === c && !c.finishing) finishCollect('');
   }
   function skipSite() {
     const c = collect;
-    if (!c || !c.cur || c.cur.state === 'work') return;
-    c.cur.state = 'skip';
-    c.cur.note = 'сайт не открылся (пропущен)';
-    saveSiteFail(c.cur);
-    openNext();
+    if (!c || !c.cur || c.cur.state !== 'work') return;
+    c.cur.skip = true;                                     /* текущий регион бросить после ближайшего запроса */
   }
   async function regionDirOf(name) {
     const root = await store.dir.getDirectoryHandle(DGD_DIR, { create: true });
     return root.getDirectoryHandle(regionFolder(name), { create: true });
   }
-  /* Сайт не открылся: в сводке это видно, а приказы прошлого сбора остаются (с пометкой) */
+  /* Регион не собран: в сводке это видно, а публикации прошлого сбора остаются (с пометкой) */
   async function saveSiteFail(s) {
     try {
       const dir = await regionDirOf(s.name);
-      const old = (await readJsonFile(dir, DGD_META)) || { region: s.name, host: s.host, pages: [], rows: [] };
+      const old = (await readJsonFile(dir, DGD_META)) || { region: s.name, slug: s.slug, pages: [], rows: [] };
       old.state = s.state === 'skip' ? 'skip' : 'fail';
       old.note = s.note;
       old.failedAt = new Date().toISOString();
       await writeJsonFile(dir, DGD_META, old);
     } catch (e) { /* папка недоступна: в окне видно */ }
   }
-  /* Один регион: меню → страницы приказов (этот и прошлый год) → строки → новые файлы за DGD_WINDOW дней */
-  async function harvest(s, hello) {
-    const html = b => decodeText(new Uint8Array(b));
-    tell(s.name + ': ищу страницы приказов в меню сайта…');
-    let pages = orderPages(hello.html || '', hello.href);
-    for (const path of [KGD_START, '/ru']) {
-      if (pages.length) break;
-      const r = await relayFetch(new URL(path, hello.href).href);
-      if (r.ok && r.bytes) pages = orderPages(html(r.bytes), r.url || hello.href);
-    }
-    if (!pages.length) throw new Error('в меню сайта нет страницы «Приказы о назначении … финансового управляющего»');
-    const dir = await regionDirOf(s.name);
-    const old = (await readJsonFile(dir, DGD_META)) || { rows: [] };
-    const savedBefore = new Map(), seenBefore = new Map(), datedBefore = new Map();
-    for (const r of old.rows || []) {
-      seenBefore.set(r.key, r.firstSeen);
-      if (r.date && r.dateFrom) datedBefore.set(r.key, r.date);
-      for (const f of r.files || []) if (f.saved) savedBefore.set(f.url, f.saved);
-    }
-    const yearNow = new Date().getFullYear(), rows = [];
-    const want = pages;
-    for (const [i, p] of want.entries()) {
-      tell(s.name + ': читаю страницу приказов ' + (i + 1) + ' из ' + want.length + (p.year ? ' (' + p.year + ' год)' : ''));
-      let r;
-      try { r = await relayFetch(p.url); } catch (e) { p.err = e.message; continue; }
-      if (!r.ok) { p.err = 'страница не открылась' + (r.status ? ' (код ' + r.status + ')' : r.error ? ': ' + r.error : ''); continue; }
-      const list = orderRows(html(r.bytes), r.url || p.url);
-      p.rows = list.length;
-      p.ok = true;
-      for (const x of list) { x.page = p.url; x.pageYear = p.year; rows.push(x); }
-    }
-    if (!want.some(p => p.ok)) throw new Error('страницы приказов не открылись: ' + want.map(p => p.err).filter(Boolean).join('; '));
-    /* какие файлы скачать: приказы за DGD_WINDOW дней (и без даты на странице этого года), которых ещё нет в папке */
+  /* Один регион: список документов gov.kz (новые сначала) → публикации о процедурах граждан за DGD_WINDOW дней →
+     страница каждой новой публикации в невидимой рамке → ссылки на файлы → файлы в папку региона → ИИН */
+  async function harvestGov(s) {
+    const base = GOV + '/org/' + s.slug;
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const since = new Date(today); since.setDate(since.getDate() - DGD_WINDOW);
-    const queue = [];
-    const dayOf = v => { const d = new Date(v); return isNaN(d) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate()); };
-    /* строки без даты (так публикует, например, Атырау): дата загрузки файла на сайт, без скачивания самого файла */
-    const undated = rows.filter(r => !r.date && r.files.some(f => !f.gov));
-    for (const [i, row] of undated.entries()) {
-      const f = row.files.find(x => !x.gov), key = f.url;
-      if (datedBefore.has(key)) { row.date = dayOf(datedBefore.get(key) + 'T00:00:00'); row.dateFrom = 'загружен на сайт'; continue; }
-      if (i % 10 === 0) tell(s.name + ': у приказов нет дат, узнаю даты загрузки на сайт: ' + (i + 1) + ' из ' + undated.length);
-      try {
-        const r = await relayFetch(f.url, 30000, 'HEAD');
-        const d = r.modified ? dayOf(r.modified) : null;
-        if (d) { row.date = d; row.dateFrom = 'загружен на сайт'; }
-      } catch (e) { /* дата останется пустой */ }
-    }
-    for (const row of rows) {
-      row.key = (row.files[0] && row.files[0].url) || row.page + '#' + row.text;
-      row.firstSeen = seenBefore.get(row.key) || isoDay(new Date());
-      const fresh = row.date ? row.date >= since : !seenBefore.has(row.key);
-      for (const f of row.files) {
-        if (f.gov) continue;
-        const was = savedBefore.get(f.url);
-        if (was) { try { await dir.getFileHandle(was); f.saved = was; continue; } catch (e) { /* файл удалили: скачать снова */ } }
-        if (fresh) queue.push({ row, f });
+    const dir = await regionDirOf(s.name);
+    const old = (await readJsonFile(dir, DGD_META)) || { rows: [] };
+    const before = new Map((old.rows || []).map(r => [r.key, r]));
+    const list = [], pages = [];
+    for (let page = 1; page <= GOV_PAGES; page++) {
+      if (s.skip) throw new Error('пропущен');
+      tell(s.name + ': список документов, страница ' + page);
+      const url = base + '/documents/' + page + '?lang=ru&size=50';
+      const r = await relayFetch(url);
+      if (!r.ok) {
+        if (page === 1) throw new Error('раздел «Документы» на gov.kz не открылся' + (r.status ? ' (код ' + r.status + ')' : r.error ? ': ' + r.error : ''));
+        break;
       }
+      const fd = (govData(decodeText(new Uint8Array(r.bytes))).getFilteredData || {}).value;
+      if (!fd || !Array.isArray(fd.data)) { if (page === 1) throw new Error('в разделе «Документы» на gov.kz нет списка'); break; }
+      pages.push({ url, read: true, rows: fd.data.length });
+      for (const x of fd.data) list.push({ id: String(x.id), title: clean(x.title || ''), date: dayOf(x.created_date) });
+      const last = fd.data[fd.data.length - 1];
+      if (!fd.data.length || !last || (dayOf(last.created_date) || today) < since || page * 50 >= (+fd.count || 0)) break;
     }
-    let got = 0;
-    for (const [i, q] of queue.entries()) {
-      tell(s.name + ': скачиваю приказ ' + (i + 1) + ' из ' + queue.length);
-      s.note = 'скачиваю ' + (i + 1) + ' из ' + queue.length;
+    const mine = list.filter(x => isGovCitizenDoc(x.title));
+    const rows = [];
+    let got = 0, n = 0;
+    const fresh = mine.filter(x => x.date && x.date >= since);
+    for (const x of mine) {
+      const key = 'gov:' + x.id, was = before.get(key);
+      const row = { key, id: x.id, date: x.date, kind: govKind(x.title), debtor: govDebtor(x.title), manager: (orderInfo([x.title], []).manager || ''),
+        text: x.title, page: base + '/documents/details/' + x.id + '?lang=ru', firstSeen: was ? was.firstSeen : isoDay(new Date()), files: [], notes: [] };
+      rows.push(row);
+      const saved = was ? (was.files || []).filter(f => f.saved) : [];
+      const yearly = govYearly(x.title);
+      let ok = saved.length > 0 && !yearly;
+      for (const f of saved) { try { await dir.getFileHandle(f.saved); } catch (e) { ok = false; } }
+      if (ok) { row.files = saved; continue; }
+      if (!(x.date && x.date >= since) && !yearly) continue;               /* старше окна: только считается */
+      if (yearly) row.yearly = true;
+      if (s.skip) throw new Error('пропущен');
+      n++;
+      s.note = 'публикация ' + n + ' из ' + fresh.length;
       showCollect();
-      let r;
-      try { r = await relayFetch(q.f.url, 180000); } catch (e) { q.f.err = e.message; continue; }
-      if (!r.ok || !r.bytes || !r.bytes.byteLength) { q.f.err = 'файл не скачался' + (r.status ? ' (код ' + r.status + ')' : ''); continue; }
-      const bytes = new Uint8Array(r.bytes);
-      if (/text\/html/i.test(r.type || '') && !/^%PDF/.test(latin1(bytes.subarray(0, 5)))) { q.f.err = 'вместо файла страница сайта'; continue; }
-      const name = orderFileName(q.row, q.f, r.type);
-      try { await writeFile(dir, name, bytes); } catch (e) { q.f.err = 'не записан: ' + e.message; continue; }
-      q.f.saved = name;
-      q.f.fresh = true;
-      got++;
-      queueOcr(regionFolder(s.name) + '/' + name, bytes, name);
-      await sleep(200);
+      tell(s.name + ': публикация ' + n + ' из ' + fresh.length + ': ищу файл');
+      let links = [];
+      try {
+        const fr = await relayFrame(row.page, 25000);
+        links = (fr.links || []).map(l => l.href);
+        if (!links.length) {                                            /* ссылки нет: адрес файла в ответах сайта странице */
+          for (const api of (fr.resources || []).filter(u => !/\.(js|css|svg|png|woff2?)(\?|$)/i.test(u)).slice(0, 8)) {
+            const j = await relayFetch(api, 30000);
+            if (!j.ok || !j.bytes) continue;
+            for (const mm of decodeText(new Uint8Array(j.bytes)).matchAll(/\/(?:uploads|api\/v1\/public\/assets|api\/v2\/(?:public\/)?files)\/[^"'\s\\<>]+/g)) links.push(GOV + mm[0]);
+          }
+        }
+        if (!links.length && fr.text) row.notes.push('на странице нет файла' + (/mainFileNotExist|не найден/i.test(fr.text) ? ' (сайт пишет, что файла нет)' : ''));
+      } catch (e) { row.notes.push('страница публикации не открылась: ' + e.message); }
+      links = Array.from(new Set(links)).filter(u => !/\.(svg|png|jpe?g)$/i.test(u) || /original/i.test(u)).slice(0, 3);
+      for (const href of links) {
+        let r;
+        try { r = await relayFetch(href, 180000); } catch (e) { row.files.push({ url: href, name: '', saved: '', err: e.message }); continue; }
+        if (!r.ok || !r.bytes || !r.bytes.byteLength) { row.files.push({ url: href, name: '', saved: '', err: 'файл не скачался' + (r.status ? ' (код ' + r.status + ')' : '') }); continue; }
+        const bytes = new Uint8Array(r.bytes);
+        let fname = '';
+        const disp = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(r.disposition || '');
+        if (disp) { try { fname = decodeURIComponent(disp[1] || disp[2]); } catch (e) { fname = disp[1] || disp[2]; } }
+        if (!fname) fname = decodeURIComponent(href.split('?')[0].split('/').pop() || '');
+        const ext = (/\.([a-z0-9]{2,4})$/i.exec(fname) || [])[1] || (/pdf/i.test(r.type) ? 'pdf' : /png/i.test(r.type) ? 'png' : /jpe?g/i.test(r.type) ? 'jpg'
+          : /wordprocessing|msword/i.test(r.type) ? 'docx' : /sheet|excel/i.test(r.type) ? 'xlsx' : 'pdf');
+        const name = orderFileName(row, { name: fname.replace(/\.[a-z0-9]{2,4}$/i, '') + '.' + ext }, r.type);
+        try { await writeFile(dir, name, bytes); } catch (e) { row.files.push({ url: href, name: fname, saved: '', err: 'не записан: ' + e.message }); continue; }
+        row.files.push({ url: href, name: fname, saved: name, err: '' });
+        got++;
+        queueOcr(regionFolder(s.name) + '/' + name, bytes, name, r.type);
+      }
+      await sleep(150);
     }
     const meta = {
-      version: VERSION, region: s.name, host: s.host, state: 'ok', note: '', collectedAt: new Date().toISOString(), window: DGD_WINDOW,
-      pages: pages.map(p => ({ url: p.url, title: p.title, year: p.year || null, rows: p.rows || 0, read: !!p.ok, err: p.err || '' })),
-      rows: rows.map(r => ({ key: r.key, date: isoDay(r.date), dateFrom: r.dateFrom || '', kind: r.kind, debtor: r.debtor, manager: r.manager, number: r.number, text: r.text,
-        page: r.page, future: r.future || false, firstSeen: r.firstSeen,
-        files: r.files.map(f => ({ url: f.url, name: f.name, gov: f.gov || false, saved: f.saved || '', err: f.err || '' })) })),
+      version: VERSION, source: 'gov.kz', region: s.name, slug: s.slug, state: 'ok', note: '', collectedAt: new Date().toISOString(), window: DGD_WINDOW,
+      pages: pages.map(p => ({ url: p.url, title: 'Документы ' + s.slug, year: null, rows: p.rows, read: p.read, err: '' })),
+      rows: rows.map(r => ({ key: r.key, id: r.id, date: isoDay(r.date), dateFrom: r.yearly ? 'сводная за год, перечитана ' + dmy(new Date()) : '', kind: r.kind, debtor: r.debtor, manager: r.manager, number: '',
+        text: r.text, page: r.page, future: false, firstSeen: r.firstSeen, notes: r.notes,
+        files: r.files.map(f => ({ url: f.url, name: f.name || '', gov: false, saved: f.saved || '', err: f.err || '' })) })),
     };
     await writeJsonFile(dir, DGD_META, meta);
-    const win = rows.filter(r => r.date && r.date >= since).length;
-    s.note = 'приказов за ' + DGD_WINDOW + ' дн. ' + win + ', новых файлов ' + got + (queue.length > got ? ', не скачано ' + (queue.length - got) : '');
+    s.note = 'публикаций за ' + DGD_WINDOW + ' дн. ' + fresh.length + ', новых файлов ' + got;
     const left = collect ? collect.sites.filter(x => x.state === 'wait').length : 0;
-    tell(s.name + ': готово (' + s.note + ').' + (left ? ' Сейчас откроется следующий регион, там снова нажмите закладку Tazalau (осталось ' + left + ').' : ' Это был последний регион: вкладку можно закрыть.'));
+    tell(s.name + ': готово (' + s.note + ').' + (left ? ' Дальше: ещё ' + left + ' регион(ов).' : ' Это был последний регион: вкладку можно закрыть.'));
   }
   function orderFileName(row, f, type) {
     const ext = (/\.([a-z0-9]{2,4})$/i.exec(f.name) || [])[1] || (/pdf/i.test(type) ? 'pdf' : /png/i.test(type) ? 'png' : 'jpg');
-    const base = (isoDay(row.date) || 'без-даты') + '_' + (safeName(row.debtor).slice(0, 40) || 'приказ') + '_' + safeName(f.name.replace(/\.[a-z0-9]{2,4}$/i, '')).slice(0, 40);
+    const base = (isoDay(row.date) || 'без-даты') + '_' + (safeName(row.debtor).slice(0, 40) || safeName(row.kind).slice(0, 30) || 'публикация') + '_' +
+      (safeName(f.name.replace(/\.[a-z0-9]{2,4}$/i, '')).slice(0, 40) || row.id || 'файл');
     return clean(base).replace(/\s+/g, ' ') + '.' + ext.toLowerCase();
   }
   /* ИИН из скачанных файлов читаются по очереди, пока скачиваются следующие */
-  function queueOcr(key, bytes, name) {
+  function queueOcr(key, bytes, name, type) {
     const c = collect;
     c.ocrLeft++;
     c.ocr = c.ocr.then(async () => {
       try {
         if (!c.cache) c.cache = (await readJsonFile(await store.dir.getDirectoryHandle(DGD_DIR, { create: true }), DGD_OCR)) || {};
-        const r = await readScan(bytes, name);
+        const r = await readOrderFile(bytes, name, type);
         c.cache[key] = { size: bytes.length, at: new Date().toISOString(), note: r.note || '', iins: r.iins.map(x => ({ iin: x.iin, conf: x.conf, how: x.how, fixes: x.fixes || 0 })) };
-      } catch (e) { c.cache[key] = { size: bytes.length, at: new Date().toISOString(), note: (e && e.message) || String(e), iins: [] }; }
+      } catch (e) { if (c.cache) c.cache[key] = { size: bytes.length, at: new Date().toISOString(), note: (e && e.message) || String(e), iins: [] }; }
       c.ocrLeft--;
       showCollect();
     });
@@ -2698,9 +2777,9 @@
     for (const p of c.pending.values()) p({ ok: false, status: 0, error: 'сбор остановлен' });
     c.pending.clear();
     try { if (!c.popup.closed) c.popup.close(); } catch (e) { /* уже закрыто */ }
-    for (const s of c.sites) if (s.state === 'open' || s.state === 'wait') { s.state = 'skip'; s.note = 'не собран' + (reason ? ' (' + reason + ')' : ''); }
+    for (const s of c.sites) if (s.state === 'work' || s.state === 'wait') { s.state = 'skip'; s.note = 'не собран' + (reason ? ' (' + reason + ')' : ''); }
     showCollect();
-    say('ДГД: дочитываю ИИН из скачанных приказов…');
+    say('ДГД: дочитываю ИИН из скачанных файлов…');
     await c.ocr;
     try { if (c.cache) await writeJsonFile(await store.dir.getDirectoryHandle(DGD_DIR, { create: true }), DGD_OCR, c.cache); } catch (e) { /* перечитается */ }
     collect = null;
@@ -2708,7 +2787,7 @@
     const wrote = await writeDgd(true);
     const ok = c.sites.filter(s => s.state === 'done').length;
     const lines = c.sites.map(s => ({ done: '✔ ', fail: '❌ ', skip: '⏭ ' }[s.state] || '· ') + s.name + (s.note ? ': ' + s.note : ''));
-    showCollect('Сбор ДГД ' + ruDate(new Date()) + ': регионов собрано ' + ok + ' из ' + c.sites.length + (reason ? ' (' + reason + ')' : '') + '\n' + lines.join('\n'));
+    showCollect('Сбор ДГД с gov.kz ' + ruDate(new Date()) + ': регионов собрано ' + ok + ' из ' + c.sites.length + (reason ? ' (' + reason + ')' : '') + '\n' + lines.join('\n'));
     say((ok === c.sites.length ? '✔ ' : '⚠ ') + 'ДГД собраны: ' + ok + ' из ' + c.sites.length + ' регионов. ' +
       (wrote ? 'Свод: ' + DGD_FILE + '. ' : '') + 'Проверка регионов ниже, в блоке «ДГД».' + (S ? ' Дальше: кнопка «Старт».' : ''));
     updateButtons();
@@ -3566,7 +3645,7 @@
       useDir, openBytes, run, timings, normBase, baseValid, folderRoom, go, buildSvg, drawSvg,
       setRegs: keys => { for (const [k, box] of regChecks) box.checked = keys.includes(k); refresh(); },
       describe, recordInfo, readRecords, makeXlsx, parseCsv, decodeText, pdfLines, fileRows, extractIins, regionsIn, readDgd, dgdWorkbook,
-      readScan, ocrIins, grayOf, ocrPlausible, orderPages, orderRows, orderInfo, samePerson, KGD_SITES,
+      readScan, readOrderFile, ocrIins, grayOf, ocrPlausible, orderInfo, samePerson, GOV_SITES, govData, govKind, govDebtor, GOV_DOC_RE, GOV_NOT_RE, isGovCitizenDoc, govYearly,
       collecting: () => collect && { sites: collect.sites.map(x => ({ key: x.key, name: x.name, state: x.state, note: x.note })), ocrLeft: collect.ocrLeft, finishing: !!collect.finishing },
       relayFetch: url => relayFetch(url, 15000),
       learnPage: async (bytes, name) => { const c = await window.__tazalau.test.debugPage(bytes, name); const dbg = []; dbg.learn = []; if (c) ocrIins(grayOf(c), dbg); return dbg.learn; },
