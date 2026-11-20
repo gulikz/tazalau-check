@@ -1,7 +1,7 @@
-/* Tazalau помощник: версия 6.
+/* Tazalau помощник: версия 7.
    Закладка для tazalau.qoldau.kz (Edge или Chrome). Ничего не устанавливает. Ежедневная проверка в три шага:
-   1) ДГД: публикации 20 департаментов на gov.kz о процедурах граждан (приказы о финансовых управляющих, объявления о
-      возбуждении дел, реестры требований кредиторов) за 31 день: файлы, ИИН из них, проверка каждого региона, свод;
+   1) ДГД: публикации 20 департаментов на gov.kz о процедурах граждан за год (раздел «Деятельность»: таблицы объявлений о
+      возбуждении дел, реестры требований кредиторов, приказы): файлы, ИИН из них, проверка каждого региона, свод;
    2) рабочий файл: выгрузка ADW (xlsx или csv) с проблемными кредитами и картами, столбец с ИИН;
    3) по каждому ИИН все шесть реестров tazalau: статус, снимок страницы, ссылки в файл; ИИН из списков ДГД первыми.
    По файлу Excel (столбец «ИИН/БИН»): открывает реестр с фильтром по ИИН, проверяет, что на странице
@@ -11,7 +11,7 @@
    Вход на сайт и ЭЦП не нужны. Файл Excel читается и изменяется только внутри браузера и никуда не отправляется. */
 (() => {
   'use strict';
-  const VERSION = '6';
+  const VERSION = '7';
   if (window.__tazalau) { window.__tazalau.show(); return; }
   if (/^(www\.)?gov\.kz$/i.test(location.hostname)) { relay(); return; }
   if (!/(^|\.)tazalau\.qoldau\.kz$/i.test(location.hostname)) {
@@ -1002,7 +1002,7 @@
     return { objs, get, dictOf, streamOf, pages };
   }
   async function pdfLines(bytes) {
-    const { objs, get, streamOf, pages } = await pdfOpen(bytes);
+    const { objs, get, dictOf, streamOf, pages } = await pdfOpen(bytes);
     const cmaps = new Map();
     async function fontMap(font) {
       if (!font) return null;
@@ -1074,6 +1074,8 @@
           curX += ((w / 1000) * size + tc + (ch === ' ' ? twd : 0)) * tz * scale;
         }
       };
+      /* Текст страницы бывает внутри шаблона (Form XObject, оператор Do): так сохраняет mPDF, например Павлодар */
+      const run = async (content, fonts, xobjects, depth) => {
       const ops = [];
       let i = 0;
       const n = content.length;
@@ -1116,7 +1118,17 @@
         else if (op === 'Tw' && nums.length) twd = nums[0];
         else if (op === 'Tz' && nums.length) tz = nums[0] / 100;
         else if (op === 'BT') { lineX = 0; scale = 1; }
+        else if (op === 'Do' && depth < 4) {
+          const nm = a.find(x => x && x.name), ref = nm && xobjects ? xobjects[nm.name] : null;
+          const o = ref && ref.ref != null ? objs.get(ref.ref) : null, d = o && o.data ? dictOf(o) : null;
+          if (d && d.Subtype && d.Subtype.name === 'Form') {
+            const res = get(d.Resources) || {};
+            await run(latin1(await streamOf(o)), get(res.Font) || fonts, get(res.XObject) || {}, depth + 1);
+          }
+        }
       }
+      };
+      await run(content, fonts, get((resources || {}).XObject) || {}, 0);
       flush();
       lines.push('');                          /* граница страниц */
     }
@@ -1853,10 +1865,139 @@
     return { date, kind, debtor, manager, number: num ? num[1] : '', future: dates.length > ok.length };
   }
 
+  /* Старый формат Excel (.xls: книга BIFF8 внутри составного файла OLE). ЗКО выкладывает так часть объявлений.
+     Читаются значения ячеек (текст, числа, готовый результат формул), оформление не нужно. */
+  function cfbStream(u8, names) {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const SIG = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1], END = 0xFFFFFFFA;
+    if (u8.length < 512 || SIG.some((b, i) => u8[i] !== b)) throw new Error('файл .xls повреждён или это не Excel');
+    const ssz = 2 ** dv.getUint16(0x1E, true), msz = 2 ** dv.getUint16(0x20, true);
+    const nFat = dv.getUint32(0x2C, true), dirStart = dv.getUint32(0x30, true), cutoff = dv.getUint32(0x38, true);
+    const miniStart = dv.getUint32(0x3C, true), nMini = dv.getUint32(0x40, true);
+    const at = n => (n + 1) * ssz;                                   /* сектор n: заголовок занимает первый */
+    const fatSecs = [];
+    for (let i = 0; i < 109 && fatSecs.length < nFat; i++) { const v = dv.getUint32(0x4C + i * 4, true); if (v < END) fatSecs.push(v); }
+    for (let d = dv.getUint32(0x44, true), k = dv.getUint32(0x48, true); d < END && k > 0 && fatSecs.length < nFat; k--) {
+      for (let i = 0; i < ssz / 4 - 1 && fatSecs.length < nFat; i++) { const v = dv.getUint32(at(d) + i * 4, true); if (v < END) fatSecs.push(v); }
+      d = dv.getUint32(at(d) + ssz - 4, true);
+    }
+    const per = ssz / 4, fat = new Uint32Array(fatSecs.length * per);
+    fatSecs.forEach((sec, k) => { if (at(sec) + ssz <= u8.length) for (let i = 0; i < per; i++) fat[k * per + i] = dv.getUint32(at(sec) + i * 4, true); });
+    const chain = (start, table) => { const out = []; for (let x = start; x < END && x < table.length && out.length < table.length; x = table[x]) out.push(x); return out; };
+    const readChain = (start, size) => {
+      const secs = chain(start, fat), out = new Uint8Array(secs.length * ssz);
+      secs.forEach((sec, i) => out.set(u8.subarray(at(sec), Math.min(at(sec) + ssz, u8.length)), i * ssz));
+      return out.subarray(0, Math.min(size, out.length));
+    };
+    const dir = readChain(dirStart, Infinity), ddv = new DataView(dir.buffer, dir.byteOffset, dir.byteLength), entries = [];
+    for (let o = 0; o + 128 <= dir.length; o += 128) {
+      const len = ddv.getUint16(o + 0x40, true);
+      let name = '';
+      for (let i = 0; i + 2 < len && i < 64; i += 2) name += String.fromCharCode(ddv.getUint16(o + i, true));
+      entries.push({ name, type: dir[o + 0x42], start: ddv.getUint32(o + 0x74, true), size: ddv.getUint32(o + 0x78, true) });
+    }
+    const e = entries.find(x => x.type === 2 && names.includes(x.name));
+    if (!e) throw new Error('в файле .xls нет листов Excel');
+    if (e.size >= cutoff) return readChain(e.start, e.size);
+    const root = entries.find(x => x.type === 5), ministream = readChain(root.start, root.size);
+    const mf = readChain(miniStart, nMini * ssz), mdv = new DataView(mf.buffer, mf.byteOffset, mf.byteLength);
+    const minifat = new Uint32Array(mf.length / 4);
+    for (let i = 0; i < minifat.length; i++) minifat[i] = mdv.getUint32(i * 4, true);
+    const secs = chain(e.start, minifat), out = new Uint8Array(secs.length * msz);
+    secs.forEach((sec, i) => out.set(ministream.subarray(sec * msz, sec * msz + msz), i * msz));
+    return out.subarray(0, e.size);
+  }
+  function xlsRows(u8) {
+    const wb = cfbStream(u8, ['Workbook', 'Book']), dv = new DataView(wb.buffer, wb.byteOffset, wb.byteLength);
+    const recs = [];
+    for (let o = 0; o + 4 <= wb.length;) { const type = dv.getUint16(o, true), len = dv.getUint16(o + 2, true); recs.push({ type, o: o + 4, len }); o += 4 + len; }
+    /* чтение через границы записей CONTINUE: посреди строки новая запись начинается с байта «два байта на знак» */
+    const reader = segs => {
+      let si = 0, pos = segs.length ? segs[0].o : 0;
+      const end = () => (si < segs.length ? segs[si].o + segs[si].len : 0);
+      const next = () => { si++; pos = si < segs.length ? segs[si].o : 0; return si < segs.length; };
+      const r = {
+        u8() { while (si < segs.length && pos >= end()) next(); return si < segs.length ? wb[pos++] : 0; },
+        u16() { return r.u8() | (r.u8() << 8); },
+        u32() { return (r.u16() | (r.u16() << 16)) >>> 0; },
+        skip(n) { while (n > 0 && si < segs.length) { if (pos >= end()) { next(); continue; } const k = Math.min(n, end() - pos); pos += k; n -= k; } },
+        chars(cch, wide) {
+          let out = '';
+          while (cch > 0 && si < segs.length) {
+            if (pos >= end()) { if (!next()) break; wide = wb[pos++] & 1; continue; }
+            const k = Math.min(cch, Math.floor((end() - pos) / (wide ? 2 : 1)));
+            if (k <= 0) { pos = end(); continue; }
+            for (let i = 0; i < k; i++) out += String.fromCharCode(wide ? wb[pos + 2 * i] | (wb[pos + 2 * i + 1] << 8) : wb[pos + i]);
+            pos += k * (wide ? 2 : 1);
+            cch -= k;
+          }
+          return out;
+        },
+      };
+      return r;
+    };
+    const sst = [], sheets = [];
+    for (let i = 0; i < recs.length; i++) {
+      const rec = recs[i];
+      if (rec.type === 0x00FC) {                                     /* общие строки и их продолжения */
+        const segs = [rec];
+        for (let j = i + 1; j < recs.length && recs[j].type === 0x003C; j++) segs.push(recs[j]);
+        const r = reader(segs);
+        r.skip(4);
+        const unique = r.u32();
+        for (let k = 0; k < unique; k++) {
+          const cch = r.u16(), flags = r.u8(), runs = flags & 8 ? r.u16() : 0, ext = flags & 4 ? r.u32() : 0;
+          sst.push(r.chars(cch, flags & 1));
+          r.skip(runs * 4 + ext);
+        }
+      } else if (rec.type === 0x0085) {                              /* лист: где начинается и как называется */
+        const r = reader([rec]), pos = r.u32(), hidden = r.u8(), kind = r.u8(), cch = r.u8(), flags = r.u8();
+        if (kind === 0) sheets.push({ pos, name: r.chars(cch, flags & 1), hidden });
+      }
+    }
+    const rk = v => {
+      let n;
+      if (v & 2) n = (v | 0) >> 2;
+      else { const b = new DataView(new ArrayBuffer(8)); b.setUint32(4, (v & 0xFFFFFFFC) >>> 0, true); n = b.getFloat64(0, true); }
+      return v & 1 ? n / 100 : n;
+    };
+    const rows = [];
+    for (const sh of sheets) {
+      const grid = new Map();
+      const put = (row, col, v, num) => { if (v == null || v === '') return; if (!grid.has(row)) grid.set(row, []); grid.get(row)[col] = { v: num ? String(v) : clean(v), num }; };
+      let k = recs.findIndex(x => x.o - 4 === sh.pos);
+      let pendingStr = null;
+      for (k = k < 0 ? recs.length : k + 1; k < recs.length && recs[k].type !== 0x000A; k++) {
+        const rec = recs[k], o = rec.o;
+        const row = () => dv.getUint16(o, true), col = () => dv.getUint16(o + 2, true);
+        if (rec.type === 0x00FD) put(row(), col(), sst[dv.getUint32(o + 6, true)], false);
+        else if (rec.type === 0x0203) put(row(), col(), dv.getFloat64(o + 6, true), true);
+        else if (rec.type === 0x027E) put(row(), col(), rk(dv.getUint32(o + 6, true)), true);
+        else if (rec.type === 0x00BD) {
+          const first = dv.getUint16(o + 2, true), n = (rec.len - 6) / 6;
+          for (let j = 0; j < n; j++) put(row(), first + j, rk(dv.getUint32(o + 4 + j * 6 + 2, true)), true);
+        } else if (rec.type === 0x0204 || rec.type === 0x00D6) {
+          const r = reader([{ o: o + 6, len: rec.len - 6 }]), cch = r.u16(), flags = r.u8();
+          put(row(), col(), r.chars(cch, flags & 1), false);
+        } else if (rec.type === 0x0006) {
+          if (dv.getUint16(o + 12, true) === 0xFFFF) { pendingStr = wb[o + 6] === 0 ? { row: row(), col: col() } : null; if (wb[o + 6] === 1) put(row(), col(), wb[o + 8] ? 'TRUE' : 'FALSE', false); }
+          else put(row(), col(), dv.getFloat64(o + 6, true), true);
+        } else if (rec.type === 0x0207 && pendingStr) {
+          const r = reader([rec]), cch = r.u16(), flags = r.u8();
+          put(pendingStr.row, pendingStr.col, r.chars(cch, flags & 1), false);
+          pendingStr = null;
+        } else if (rec.type === 0x0205 && !wb[o + 7]) put(row(), col(), wb[o + 6] ? 'TRUE' : 'FALSE', false);
+      }
+      for (const r of Array.from(grid.keys()).sort((a, b) => a - b)) rows.push({ sheet: sh.name, row: r + 1, cells: grid.get(r) });
+    }
+    return rows;
+  }
+
   /* Строки файла: [{ sheet, row, cells: [{ v, num }] }] */
   async function fileRows(name, bytes) {
     const ext = ((/\.([a-z0-9]+)$/i.exec(name) || [])[1] || '').toLowerCase();
     const textRows = lines => lines.map((t, i) => ({ row: i + 1, cells: [{ v: clean(t), num: false }] })).filter(r => r.cells[0].v);
+    if (ext === 'xls') return { kind: 'Excel (.xls)', rows: xlsRows(bytes) };
     if (ext === 'xlsx' || ext === 'xlsm') {
       const b = await openBook(bytes, name), rows = [];
       for (const sh of b.sheets) {
@@ -1912,7 +2053,7 @@
     }
     const scan = /^(jpe?g|png|tiff?|bmp|gif|heic)$/.test(ext);
     return { kind: ext ? '.' + ext : 'без расширения', rows: [], note: scan ? 'это картинка (скан): ИИН не прочитаны, нужна проверка вручную'
-      : ext === 'xls' || ext === 'doc' || ext === 'rtf' ? 'старый формат .' + ext + ': откройте в Excel или Word и сохраните как .xlsx или .docx' : 'формат не поддерживается' };
+      : ext === 'doc' || ext === 'rtf' ? 'старый формат .' + ext + ': откройте в Word и сохраните как .docx' : 'формат не поддерживается' };
   }
 
   /* ИИН из строк файла. Заголовок (строка со словом «ИИН») подсказывает, где ФИО, дата и управляющий. */
@@ -1947,6 +2088,12 @@
             if (iinOk(x) && personalIin(x) && !found.has(x)) found.set(x, i);
           }
         }
+        if (found.size === before) {          /* в PDF ИИН слился со следующим числом: «ИИН 87091630164224000» */
+          for (const m of c.v.matchAll(/(?:ИИН|ЖСН)\D{0,12}?(\d{13,})/gi)) {
+            const x = m[1].slice(0, 12);
+            if (iinOk(x) && personalIin(x) && !found.has(x)) found.set(x, i);
+          }
+        }
         if (found.size === before && whole && whole.err && (role[i] === 'iin' || (!head && /^\d{12}$/.test(c.v)))) {
           invalid.push({ where: (r.sheet ? r.sheet + ', ' : '') + 'строка ' + r.row, raw: c.v, err: whole.err });
         }
@@ -1969,6 +2116,89 @@
       }
     }
     return { items, invalid };
+  }
+
+  /* Таблица «Объявление о возбуждении производства по делу о … восстановлении платежеспособности / судебном банкротстве и
+     порядке заявления требований кредиторами» (xlsx на gov.kz, по региону за год). Заголовки у регионов разные (русский,
+     казахский, разный порядок), поэтому столбцы узнаются по смыслу. null: это не такая таблица. */
+  const ANN_TITLE_RE = rx('объявлени\\S*\\s+о\\s+возбуждени|іс\\s+қозғау|хабарландыру');
+  const ANN_IIN_HEAD = /идентификацион|(^|[^а-яё])иин([^а-яё]|$)|жсн|жеке\s+сәйкестендіру|сәйкестендіру\s+нөмір/;
+  const ANN_RUS_HEAD = /фамили|фио|(^|[^а-яё])иин([^а-яё]|$)|должник/;
+  function parseAnnSheet(rows) {
+    let hi = -1;
+    for (let i = 0; i < Math.min(rows.length, 40); i++) {
+      const t = rows[i].cells.filter(Boolean).map(c => c.v.toLowerCase());
+      if (t.length >= 3 && t.some(x => ANN_IIN_HEAD.test(x)) && t.some(x => /фамили|фио|ф\.\s*и\.\s*о|аты|тегі/.test(x))) { hi = i; break; }
+    }
+    if (hi < 0) return null;
+    const head = rows[hi].cells, cols = head.length + 2;
+    const text = i => ((head[i] && head[i].v) || '').toLowerCase();
+    const role = {}, used = new Set();
+    const pick = (key, test) => { for (let i = 0; i < cols; i++) if (!used.has(i) && text(i) && test(text(i))) { role[key] = i; used.add(i); return; } };
+    const FIO = /фамили|фио|ф\.\s*и\.\s*о|аты-?\s*жөн|тегі/, MGR = /управляющ|басқарушы/;
+    pick('n', t => /^\s*(№|n\s*п|п\/п)/.test(t));
+    pick('iin', t => ANN_IIN_HEAD.test(t) && !MGR.test(t));
+    pick('fio', t => FIO.test(t) && !MGR.test(t));
+    pick('manager', t => FIO.test(t) && MGR.test(t));
+    pick('claimsAddress', t => /адрес|мекен\s*-?\s*жай/.test(t) && /прием|приём|қабылда/.test(t));
+    pick('address', t => /адрес|мекен\s*-?\s*жай|орналасқан\s+жер/.test(t));
+    pick('court', t => /суд|сот/.test(t) && /наименован|атау/.test(t));
+    pick('ruling', t => /определени|ұйғарым|вынесени|шешім/.test(t));
+    pick('claims', t => /срок|мерзім/.test(t) && /требован|талап/.test(t));
+    pick('contacts', t => /контакт|байланыс|телефон/.test(t));
+    pick('posted', t => /размещени|орналастыр|опубликов|жариял/.test(t));
+    if (role.manager == null) pick('manager', t => FIO.test(t));                       /* второй столбец с ФИО: управляющий */
+    if (role.claims != null && !text(role.claims + 1) && !used.has(role.claims + 1)) { role.to = role.claims + 1; used.add(role.to); }
+    if (role.iin == null) return null;
+    let start = hi + 1;
+    while (start < rows.length && start <= hi + 3) {                                  /* «с / до» и строка с номерами столбцов */
+      const vals = rows[start].cells.filter(Boolean).map(c => clean(c.v));
+      if (vals.length && (vals.every(v => /^\d{1,2}$/.test(v)) || vals.every(v => /^(с|до|от|по|бастап|дейін|\d{1,2})$/i.test(v)))) start++;
+      else break;
+    }
+    const day = c => {
+      if (!c || !clean(c.v)) return null;
+      if (c.num && +c.v > 20000 && +c.v < 80000) { const d = new Date(1899, 11, 30 + Math.floor(+c.v)); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+      return maxDate(datesIn(c.v)) || null;
+    };
+    const records = [], invalid = [];
+    for (const r of rows.slice(start)) {
+      const cell = k => (role[k] != null ? r.cells[role[k]] || null : null), val = k => (cell(k) ? clean(cell(k).v) : '');
+      const raw = cell('iin');
+      const p = raw && clean(raw.v) ? normIin(raw.v, raw.num) : null;
+      let iin = p && p.iin ? p.iin : '';
+      if (!iin) for (const c of r.cells) { const m = c && /(?<!\d)\d{12}(?!\d)/.exec(c.v); if (m && iinOk(m[0])) { iin = m[0]; break; } }
+      const fio = val('fio');
+      if (!iin && !fio) continue;
+      if (!iin && p && p.err) invalid.push({ where: (r.sheet ? r.sheet + ', ' : '') + 'строка ' + r.row, raw: raw.v, err: p.err });
+      records.push({ n: val('n'), fio, iin, address: val('address'), court: val('court'), ruling: day(cell('ruling')), manager: val('manager'),
+        from: day(cell('claims')), to: day(cell('to')), claimsAddress: val('claimsAddress'), contacts: val('contacts'), posted: day(cell('posted')),
+        row: r.row, sheet: r.sheet || '' });
+    }
+    const russian = head.some((c, i) => ANN_RUS_HEAD.test(text(i)));
+    return { records, invalid, roles: role, headerRow: rows[hi].row, russian };
+  }
+  /* Каждый лист отдельно; лист-перевод (казахский и русский с теми же должниками) не удваивает строки: повтор (тот же ИИН
+     или ФИО, те же даты) берётся один раз, русский лист первым */
+  function parseAnnouncements(rows) {
+    const sheets = new Map();
+    for (const r of rows) { const k = r.sheet || ''; if (!sheets.has(k)) sheets.set(k, []); sheets.get(k).push(r); }
+    const parsed = Array.from(sheets.values()).map(parseAnnSheet).filter(Boolean);
+    if (!parsed.length) return null;
+    parsed.sort((a, b) => (a.russian === b.russian ? 0 : a.russian ? -1 : 1));
+    const records = [], invalid = [], seen = new Set();
+    const t = d => (d ? d.getTime() : '');
+    for (const p of parsed) {
+      const bad = new Set(p.invalid.map(x => x.where));
+      for (const rec of p.records) {
+        const key = (rec.iin || clean(rec.fio).toLowerCase()) + '|' + t(rec.ruling) + '|' + t(rec.posted);
+        if (seen.has(key)) { bad.delete((rec.sheet ? rec.sheet + ', ' : '') + 'строка ' + rec.row); continue; }
+        seen.add(key);
+        records.push(rec);
+      }
+      for (const x of p.invalid) if (bad.has(x.where)) invalid.push(x);
+    }
+    return { records, invalid, roles: parsed[0].roles, headerRow: parsed[0].headerRow, sheets: parsed.length };
   }
 
   /* Все файлы подпапки «ДГД» (и её подпапок): публикации, собранные с gov.kz (в папке региона файл DGD_META), и файлы,
@@ -2000,34 +2230,86 @@
       cacheChanged = true;
       return cache[key];
     };
-    const out = { files: [], items: [], orders: [], sites: [], at: new Date() };
+    const out = { files: [], items: [], orders: [], sites: [], announcements: [], at: new Date() };
     const used = new Set();
     for (const m of metas.sort((a, b) => a.folder.localeCompare(b.folder, 'ru'))) {
       const meta = m.data, region = meta.region;
       const site = { region, host: meta.host || '', state: meta.state || 'ok', note: meta.note || '', collectedAt: meta.collectedAt ? new Date(meta.collectedAt) : null,
-        failedAt: meta.failedAt ? new Date(meta.failedAt) : null, window: meta.window || DGD_WINDOW, pages: meta.pages || [], rows: [] };
+        failedAt: meta.failedAt ? new Date(meta.failedAt) : null, window: meta.window || DGD_WINDOW, pages: meta.pages || [], rows: [],
+        path: Array.from(new Set((meta.rows || []).filter(x => ANN_TITLE_RE.test(x.text || '')).map(x => x.path).filter(Boolean))).join('; '), via: meta.via || '' };
       for (const r of meta.rows || []) {
         const row = { region, date: r.date ? new Date(r.date + 'T00:00:00') : null, dateFrom: r.dateFrom || '', kind: r.kind || '', debtor: r.debtor || '',
           manager: r.manager || '', number: r.number || '', text: r.text || '', page: r.page || '', future: !!r.future, firstSeen: r.firstSeen || '',
           files: [], iins: [], gov: (r.files || []).some(f => f.gov), notes: [].concat(r.notes || []) };
+        row.path = r.path || '';
+        row.annRecords = 0;
         for (const f of r.files || []) {
           const file = { url: f.url, name: f.name, gov: !!f.gov, saved: f.saved || '', err: f.err || '', path: '' };
           row.files.push(file);
           if (!f.saved) continue;
           file.path = DGD_DIR + '/' + m.folder + '/' + f.saved;
           used.add(file.path);
+          if (/\.(xlsx|xlsm|xls)$/i.test(f.saved)) {                   /* таблица: объявления о возбуждении дел (строка на должника) */
+            try {
+              const bytes = new Uint8Array(await (await (await m.dir.getFileHandle(f.saved)).getFile()).arrayBuffer());
+              const parsed = await fileRows(f.saved, bytes), ann = parseAnnouncements(parsed.rows);
+              if (ann && ann.records.length) {
+                /* о возбуждении дела (есть срок приёма требований или так названа): в общий лист объявлений;
+                   о применении, завершении процедуры, признании банкротом: только ИИН с видом из названия */
+                const initiation = ann.roles.claims != null || ANN_TITLE_RE.test(row.text);
+                const kind = initiation ? 'объявление о возбуждении дела' : (row.kind && row.kind !== 'публикация' ? row.kind : 'таблица ДГД');
+                if (initiation) { row.annRecords += ann.records.length; row.annInvalid = (row.annInvalid || 0) + ann.invalid.length; }
+                else row.tableRecords = (row.tableRecords || 0) + ann.records.length;
+                for (const rec of ann.records) {
+                  if (initiation) out.announcements.push(Object.assign({ region, page: row.page, path: file.path, title: row.text }, rec));
+                  if (rec.iin && !row.iins.some(y => y.iin === rec.iin)) row.iins.push({ iin: rec.iin, conf: 'high', how: 'таблица ДГД', path: file.path, rec, kind });
+                }
+                continue;
+              }
+              for (const x of extractIins(parsed.rows).items) if (!row.iins.some(y => y.iin === x.iin)) row.iins.push({ iin: x.iin, conf: 'high', how: 'текст файла', path: file.path });
+            } catch (e) { row.notes.push('файл не прочитан: ' + ((e && e.message) || e)); }
+            continue;
+          }
           let res;
           try { res = await scanOf(m.folder + '/' + f.saved, await m.dir.getFileHandle(f.saved), f.saved); }
           catch (e) { res = { iins: [], note: 'файла нет в папке' }; }
           if (res.note && !res.iins.length) row.notes.push(res.note);
-          for (const x of res.iins) if (!row.iins.some(y => y.iin === x.iin)) row.iins.push(Object.assign({ path: file.path }, x));
+          /* реестр требований: по одному должнику; первый ИИН (в шапке) его, следующие ниже по тексту обычно кредитор-гражданин
+             или управляющий: такие помечаются «сверить» */
+          const several = res.iins.length > 1 && /реестр требований/.test(row.kind);
+          res.iins.forEach((x, k) => {
+            if (row.iins.some(y => y.iin === x.iin)) return;
+            row.iins.push(Object.assign({ path: file.path }, x, several && k > 0 ? { conf: 'medium', how: x.how + ' (ниже по тексту: возможно, кредитор или управляющий)', later: true } : {}));
+          });
         }
+        for (const iin of r.titleIins || []) if (!row.iins.some(y => y.iin === iin)) row.iins.push({ iin, conf: 'high', how: 'название публикации', path: '' });
         site.rows.push(row);
         out.orders.push(row);
         for (const x of row.iins) {
-          out.items.push({ iin: x.iin, fio: row.debtor, mgr: row.manager, date: row.date, listDate: row.date, region, path: x.path, kind: row.kind,
-            conf: x.conf, how: x.how, page: row.page, where: (row.kind || 'публикация') + (row.number ? ' № ' + row.number : '') + (row.date ? ' от ' + dmy(row.date) : '') });
+          const rec = x.rec;
+          out.items.push(rec
+            ? { iin: x.iin, fio: rec.fio, mgr: rec.manager, date: rec.posted || rec.ruling || row.date, listDate: rec.posted || row.date, region, path: x.path || row.page,
+                kind: x.kind, conf: 'high', how: x.how, page: row.page, court: rec.court, contacts: rec.contacts,
+                where: x.kind + (rec.ruling ? (x.kind === 'объявление о возбуждении дела' ? ', определение' : ', решение') + ' суда от ' + dmy(rec.ruling) : '') +
+                  (rec.posted ? ', размещено ' + dmy(rec.posted) : '') + (rec.to ? ', требования до ' + dmy(rec.to) : '') }
+            : { iin: x.iin, fio: row.debtor, mgr: row.manager, date: row.date, listDate: row.date, region, path: x.path || row.page, kind: row.kind,
+                conf: x.conf, how: x.how, page: row.page, later: !!x.later, where: (row.kind || 'публикация') + (row.number ? ' № ' + row.number : '') + (row.date ? ' от ' + dmy(row.date) : '') });
         }
+      }
+      /* Один и тот же должник в нескольких файлах региона (обновлённая таблица рядом с прежней, лист-перевод): в общем списке
+         объявлений один раз, из самой свежей публикации */
+      const mine = out.announcements.filter(a => a.region === region);
+      if (mine.length) {
+        const order = new Map(site.rows.slice().sort((a2, b2) => (b2.date || 0) - (a2.date || 0)).map((r2, i) => [r2.page, i]));
+        const at = a => (order.has(a.page) ? order.get(a.page) : order.size);
+        mine.sort((a2, b2) => at(a2) - at(b2));
+        const seen = new Set(), keep = [], t = d => (d ? d.getTime() : '');
+        for (const a of mine) {
+          const key = (a.iin || a.fio.toLowerCase()) + '|' + t(a.ruling) + '|' + t(a.posted);
+          if (!seen.has(key)) { seen.add(key); keep.push(a); }
+        }
+        site.annDuplicates = mine.length - keep.length;
+        out.announcements = out.announcements.filter(a => a.region !== region).concat(keep);
       }
       out.sites.push(site);
     }
@@ -2095,29 +2377,38 @@
       const warn = t => { problems.push(t); if (level !== 'bad') level = 'warn'; };
       const r = { name, files, items: items.length, unique, invalid, listDate, lastDate, site, level, text: '' };
       if (site) {
-        const since = new Date(today); since.setDate(since.getDate() - (site.window || DGD_WINDOW));
-        const win = site.rows.filter(x => x.date && x.date >= since), year = site.rows.filter(x => x.date && x.date.getFullYear() === today.getFullYear());
-        const last = maxDate(site.rows.map(x => x.date));
-        Object.assign(r, { win: win.length, year: year.length, lastOrder: last, read: win.filter(x => x.iins.length).length,
-          unread: win.filter(x => !x.iins.length && x.files.some(f => f.saved)).length, pages: site.pages.length });
+        /* gov.kz: публикации года о гражданах; главное: таблицы объявлений о возбуждении дел (строка на должника) */
+        const anns = (dg.announcements || []).filter(x => x.region === name);
+        /* объявление о возбуждении дела: по названию или по содержимому (г. Алматы кладёт таблицу объявлений в «Информационное сообщение ФЛ 2026») */
+        const annDocs = site.rows.filter(x => ANN_TITLE_RE.test(x.text) || x.annRecords > 0);
+        /* ИИН объявлений: строки таблиц и ИИН из объявлений-документов (Word или PDF на одного должника) */
+        const annIins = new Set(anns.map(x => x.iin).filter(Boolean));
+        for (const x of annDocs) for (const y of x.iins) annIins.add(y.iin);
+        const uniq = annIins.size;
+        const posted = maxDate(anns.map(x => x.posted).filter(d => d && d <= today));
+        const lastPub = maxDate(site.rows.map(x => x.date));
+        const invalidAnn = site.rows.reduce((a2, x) => a2 + (x.annInvalid || 0), 0);
+        const future = anns.filter(x => x.posted && x.posted > today).length;
+        Object.assign(r, { win: site.rows.length, year: annDocs.length, lastOrder: posted || lastPub, read: uniq, unread: site.rows.filter(x => !x.iins.length && x.files.some(f => f.saved)).length,
+          pages: site.pages.length, annRows: anns.length, annUnique: uniq, annPosted: posted, path: site.path || '' });
         const when = site.collectedAt ? ' (собрано ' + dmy(site.collectedAt) + ')' : '';
-        if (site.state === 'skip') bad('сайт не открылся' + (site.rows.length ? '; приказы с прошлого сбора' + when : ''));
-        else if (site.state !== 'ok') bad((site.note || 'сбор не удался') + (site.rows.length ? '; приказы с прошлого сбора' + when : ''));
+        if (site.state === 'skip') bad('gov.kz не ответил' + (site.rows.length ? '; данные прошлого сбора' + when : ''));
+        else if (site.state !== 'ok') bad((site.note || 'сбор не удался') + (site.rows.length ? '; данные прошлого сбора' + when : ''));
         if (site.state !== 'ok') { /* причина уже названа */ }
-        else if (!site.pages.some(p => p.read)) bad('раздел «Документы» на gov.kz не открылся');
-        else if (!win.length) bad('0 публикаций за ' + (site.window || DGD_WINDOW) + ' дн.');
-        else if (win.length <= DGD_FEW) warn('всего ' + win.length + ' публикаци' + (win.length === 1 ? 'я' : 'и') + ' за ' + (site.window || DGD_WINDOW) + ' дн.: проверить на gov.kz');
-        if (last && days(last) > DGD_SITE_STALE) warn('последняя публикация ' + dmy(last) + ': ' + days(last) + ' дн. назад');
-        if (r.unread) warn('ИИН не прочитан в публикациях: ' + r.unread + ' (открыть файл, сверить вручную)');
-        const nofile = win.filter(x => !x.files.some(f => f.saved)).length;
-        if (nofile) warn('без файла: ' + nofile + ' (открыть публикацию на gov.kz)');
-        const doubt = win.filter(x => x.iins.some(y => y.conf !== 'high')).length;
-        if (doubt) warn('ИИН прочитан неуверенно: ' + doubt + ' (сверить с приказом)');
-        const undated = site.rows.filter(x => !x.date).length;
-        if (undated) warn('строк без даты: ' + undated);
-        const future = site.rows.filter(x => x.future).length;
-        if (future) warn('дата приказа в будущем: ' + future);
-        if (site.state === 'ok' && site.rows.length && !year.length && today.getMonth() > 0) warn('публикаций за ' + today.getFullYear() + ' год на gov.kz нет');
+        else if (!site.rows.length) bad('публикаций о гражданах за ' + today.getFullYear() + ' год на gov.kz не найдено');
+        else if (!annDocs.length) warn('объявления о возбуждении дел за ' + today.getFullYear() + ' год нет (есть другие публикации: ' + site.rows.length + ')');
+        else if (!anns.length && !annIins.size) bad('в объявлениях о возбуждении дел 0 строк (файл не скачался или не прочитан)');
+        else if (uniq <= DGD_FEW) warn('всего ' + uniq + ' ИИН в объявлениях: проверить на gov.kz');
+        if (posted && days(posted) > DGD_SITE_STALE) warn('последнее объявление размещено ' + dmy(posted) + ': ' + days(posted) + ' дн. назад');
+        if (future) warn('дата размещения в будущем: ' + future + ' (ошибка в файле ДГД, сверить)');
+        if (invalidAnn) warn('ИИН с ошибкой в таблицах объявлений: ' + invalidAnn + ' (так в файле ДГД)');
+        if (r.unread) warn('ИИН не прочитан в файлах: ' + r.unread + ' (открыть файл, сверить вручную)');
+        const nofile = site.rows.filter(x => !x.files.some(f => f.saved) && !x.iins.length).length;
+        if (nofile) warn('без файла и без ИИН в названии: ' + nofile);
+        const doubt = site.rows.filter(x => x.iins.some(y => y.conf !== 'high' && !y.later)).length;
+        if (doubt) warn('ИИН прочитан со скана неуверенно: ' + doubt + ' (сверить)');
+        const later = site.rows.filter(x => x.iins.some(y => y.later)).length;
+        if (later) warn('в реестре требований больше одного ИИН: ' + later + ' (второй, возможно, кредитор или управляющий: сверить)');
       }
       if (files.length || !site) {
         const newest = maxDate([listDate, lastDate]);
@@ -2143,32 +2434,44 @@
   async function dgdWorkbook(dg) {
     const lvl = { bad: STYLE.bad, warn: STYLE.warn, good: STYLE.good };
     const link = (v, to) => (to ? { v, link: to } : v);
-    const regionRows = [['Регион', 'Проверка', 'gov.kz: сбор', 'Последняя публикация', 'Публикаций за ' + DGD_WINDOW + ' дн.', 'Публикаций за год', 'ИИН прочитан',
-      'ИИН не прочитан', 'Файлов вручную', 'Уникальных ИИН', 'Неверных ИИН', 'Дата списка (файлы)', 'Раздел «Документы» на gov.kz', 'Файлы']]
+    const year = new Date().getFullYear();
+    /* «Регионы»: проверка каждого из 20 регионов */
+    const regionRows = [['Регион', 'Проверка', 'gov.kz: сбор', 'Где на gov.kz', 'Объявлений о возбуждении (файлов)', 'Строк в объявлениях', 'Уникальных ИИН',
+      'Последнее размещение', 'Других публикаций', 'Файлов вручную', 'Уникальных ИИН (файлы вручную)', 'Неверных ИИН (файлы вручную)', 'Дата списка (файлы)', 'Файлы']]
       .concat(dg.regions.map(r => [r.name, { v: r.text, s: lvl[r.level] },
         r.site ? (r.site.state === 'ok' ? dmy(r.site.collectedAt) : 'не открылся ' + dmy(r.site.failedAt || r.site.collectedAt)) : 'нет',
-        dmy(r.lastOrder), r.site ? String(r.win) : '', r.site ? String(r.year) : '', r.site ? String(r.read) : '', r.site ? String(r.unread) : '',
-        String(r.files.length), String(r.unique), String(r.invalid), dmy(r.listDate),
-        r.site ? (r.site.pages[0] ? r.site.pages[0].url.replace(/\/documents\/\d+\?.*$/, '/documents/1?lang=ru') : '') : '', r.files.map(f => f.path).join('; ')]));
+        r.site ? r.site.path || r.site.via || '' : '', r.site ? String(r.year || 0) : '', r.site ? String(r.annRows || 0) : '', r.site ? String(r.annUnique || 0) : '',
+        r.site ? dmy(r.annPosted) : '', r.site ? String((r.win || 0) - (r.year || 0)) : '',
+        String(r.files.length), String(new Set(dg.items.filter(x => (x.region || 'Регион не определён') === r.name && !x.page).map(x => x.iin)).size), String(r.invalid),
+        dmy(r.listDate), r.files.map(f => f.path).join('; ')]));
+    /* «Объявления»: все таблицы «Объявление о возбуждении производства…» всех регионов одной таблицей */
+    const ann = (dg.announcements || []).slice().sort((a2, b2) => (a2.region || '').localeCompare(b2.region || '', 'ru') || ((b2.posted || 0) - (a2.posted || 0)));
+    const annRows = [['Регион', '№', 'ФИО должника', 'ИИН должника', 'Адрес должника', 'Суд', 'Дата определения суда', 'Финансовый управляющий',
+      'Приём требований с', 'Приём требований до', 'Адрес приёма требований', 'Контакты управляющего', 'Дата размещения', 'Публикация на gov.kz', 'Файл']]
+      .concat(ann.map(x => [x.region, x.n, x.fio, x.iin ? x.iin : { v: 'нет ИИН', s: STYLE.warn }, x.address, x.court, dmy(x.ruling), x.manager, dmy(x.from), dmy(x.to),
+        x.claimsAddress, x.contacts, dmy(x.posted), link(x.title || x.page, x.page), link(x.path.slice(DGD_DIR.length + 1), x.path)]));
     const conf = x => (x.conf === 'high' || !x.conf ? '' : ' (сверить)');
-    const orderRowsOut = [['Регион', 'Дата публикации', 'Вид', 'Должник (как в названии)', 'Финансовый управляющий', 'ИИН', 'Как прочитан ИИН', 'Файл', 'Публикация на gov.kz', 'Впервые увиден', 'Название публикации']]
-      .concat((dg.orders || []).slice().sort((a, b) => (b.date || 0) - (a.date || 0)).map(o => {
+    const orderRowsOut = [['Регион', 'Дата публикации', 'Вид', 'Должник (как в названии)', 'ИИН', 'Как прочитан ИИН', 'Где на gov.kz', 'Файл', 'Публикация на gov.kz', 'Впервые увиден', 'Название публикации']]
+      .concat((dg.orders || []).slice().sort((a2, b2) => (b2.date || 0) - (a2.date || 0)).map(o => {
         const f = o.files.find(x => x.saved) || o.files[0] || {};
-        return [o.region, dmy(o.date) + (o.dateFrom ? ' (' + o.dateFrom + ')' : ''), o.kind, o.debtor, o.manager,
-          o.iins.length ? { v: o.iins.map(x => x.iin).join(', '), s: o.iins.some(x => x.conf !== 'high') ? STYLE.warn : 0 } : (f.saved ? { v: 'не прочитан', s: STYLE.warn } : ''),
-          o.iins.map(x => x.how + conf(x)).join('; ') || o.notes.join('; ') || f.err || (f.saved ? '' : o.date && (new Date() - o.date) / 86400000 > DGD_WINDOW ? 'файл не скачивался (старше ' + DGD_WINDOW + ' дн.)' : 'файла нет'),
-          f.saved ? link(f.path.slice(DGD_DIR.length + 1), f.path) : link(f.url || '', f.url), link(o.page, o.page), o.firstSeen, o.text];
+        const many = o.annRecords ? { v: 'строк: ' + o.annRecords + ', ИИН: ' + o.iins.length + ' (лист «Объявления ' + year + '»)' }
+          : o.tableRecords ? { v: 'строк: ' + o.tableRecords + ', ИИН: ' + o.iins.length + ' (лист «ИИН»)' } : null;
+        return [o.region, dmy(o.date), o.kind, o.debtor,
+          many || (o.iins.length ? { v: o.iins.map(x => x.iin).join(', '), s: o.iins.some(x => x.conf !== 'high') ? STYLE.warn : 0 } : (f.saved ? { v: 'не прочитан', s: STYLE.warn } : '')),
+          many ? (o.annRecords ? 'таблица объявлений' : 'таблица ДГД') : o.iins.map(x => x.how + conf(x)).join('; ') || o.notes.join('; ') || f.err || (f.saved ? '' : 'файла нет'),
+          o.path || '', f.saved ? link(f.path.slice(DGD_DIR.length + 1), f.path) : link(f.url || '', f.url), link(o.page, o.page), o.firstSeen, o.text];
       }));
-    const iinRows = [['ИИН', 'ФИО в списке', 'Регион', 'Дата в строке', 'Финансовый управляющий', 'Дата списка', 'Файл', 'Где в файле']]
+    const iinRows = [['ИИН', 'ФИО', 'Регион', 'Дата', 'Финансовый управляющий', 'Дата списка', 'Файл', 'Где']]
       .concat(dg.items.map(x => [x.iin, x.fio, x.region || 'не определён', dmy(x.date), x.mgr, dmy(x.listDate), { v: x.path, link: x.path }, x.where + conf(x)]));
     const fileRowsOut = [['Файл', 'Регион', 'Формат', 'Дата списка', 'Строк с ИИН', 'Уникальных ИИН', 'Неверных ИИН', 'Примечание']]
       .concat(dg.files.map(f => [{ v: f.path, link: f.path }, f.region || 'не определён', f.kind, dmy(f.listDate), String(f.count), String(f.unique),
         String(f.invalid.length), { v: [f.note, f.dateNote].concat(f.invalid.slice(0, 5).map(x => x.where + ': ' + x.raw + ' (' + x.err + ')')).filter(Boolean).join('; '),
           s: f.failed || (f.note && !/распознан$/.test(f.note)) ? STYLE.warn : 0 }]));
     return makeXlsx([
-      { name: 'Регионы', rows: regionRows, widths: [30, 60, 16, 14, 12, 12, 11, 12, 10, 12, 11, 14, 70, 50] },
-      { name: 'Публикации', rows: orderRowsOut, widths: [26, 14, 30, 34, 30, 15, 26, 46, 50, 12, 70] },
-      { name: 'ИИН', rows: iinRows, widths: [15, 36, 28, 14, 36, 13, 40, 30] },
+      { name: 'Регионы', rows: regionRows, widths: [30, 60, 16, 60, 14, 12, 12, 14, 12, 10, 14, 12, 14, 50] },
+      { name: 'Объявления ' + year, rows: annRows, widths: [26, 6, 34, 15, 40, 30, 14, 32, 13, 13, 36, 30, 13, 50, 40] },
+      { name: 'Публикации', rows: orderRowsOut, widths: [26, 14, 30, 34, 20, 26, 50, 46, 50, 12, 70] },
+      { name: 'ИИН', rows: iinRows, widths: [15, 36, 28, 14, 36, 13, 40, 50] },
       { name: 'Файлы', rows: fileRowsOut, widths: [44, 28, 10, 13, 13, 16, 14, 70] },
     ]);
   }
@@ -2274,7 +2577,7 @@
   /* Сбор публикаций ДГД 20 регионов с gov.kz: вкладка gov.kz + закладка в ней (см. relay) */
   const collectB = button('🌐 Собрать ДГД с gov.kz', () => collectDgd(), true,
     'Помощник откроет вкладку gov.kz: нажмите в ней закладку Tazalau один раз. Он соберёт публикации ДГД всех 20 регионов о процедурах граждан ' +
-    '(приказы о финансовых управляющих, объявления о возбуждении дел, реестры требований) за ' + DGD_WINDOW + ' дней в подпапку «' + DGD_DIR + '» и прочитает ИИН.');
+    'за год (таблицы объявлений о возбуждении дел, реестры требований кредиторов, приказы) в подпапку «' + DGD_DIR + '» и прочитает ИИН.');
   const collectBox = h('div', 'display:none;white-space:pre-line;max-height:240px;overflow:auto;margin:2px 0 4px;padding:4px 6px;' +
     'background:#fff;border:1px solid #d5dbe5;border-radius:4px;font-size:12px');
   collectBox.id = 'tazalau-collect';
@@ -2536,14 +2839,18 @@
     return !(A[2] && B[2] && A[2][0] !== B[2][0]);
   }
   const dgdLine = x => (x.page
-    ? x.region + ', ' + x.where + (x.mgr ? ', управляющий: ' + x.mgr : '') + (x.conf && x.conf !== 'high' ? ', ИИН прочитан со скана неуверенно: сверить с приказом' : '')
+    ? x.region + ', ' + x.where + (x.mgr ? ', управляющий: ' + x.mgr : '') + (x.conf && x.conf !== 'high'
+      ? (x.later ? ', ИИН ниже по тексту реестра (возможно, кредитор или управляющий): сверить' : ', ИИН прочитан со скана неуверенно: сверить с приказом') : '')
     : (x.region || 'регион не определён') + ', список от ' + dmy(x.listDate) + (x.date ? ', дата ' + dmy(x.date) : '') + (x.mgr ? ', управляющий: ' + x.mgr : '') +
       (x.conf && x.conf !== 'high' ? ', ИИН прочитан со скана неуверенно' : ''));
   /* Столбец «ДГД» рабочего файла: регион, приказ или список, финансовый управляющий; ссылка на файл ДГД.
      Приказ, где ИИН не прочитан, сверяется по ФИО: такая строка помечается «возможно» и жёлтым. */
   async function fillDgd(S) {
     const L = S.layout;
-    const blind = (dgd.orders || []).filter(o => !o.iins.length && o.debtor);
+    /* без прочитанного ИИН: публикации (ФИО из названия) и строки таблиц объявлений с пустым или ошибочным ИИН */
+    const blind = (dgd.orders || []).filter(o => !o.iins.length && o.debtor).concat((dgd.announcements || []).filter(a => !a.iin && a.fio)
+      .map(a => ({ region: a.region, debtor: a.fio, kind: 'объявление о возбуждении дела (ИИН в строке пустой или с ошибкой)', date: a.posted || null,
+        manager: a.manager, files: [{ saved: true, path: a.path, url: a.page }] })));
     let marked = 0;
     for (const t of tasks) {
       const hits = t.parse.iin ? dgd.byIin.get(t.parse.iin) || [] : [];
@@ -2678,95 +2985,153 @@
       await writeJsonFile(dir, DGD_META, old);
     } catch (e) { /* папка недоступна: в окне видно */ }
   }
-  /* Один регион: список документов gov.kz (новые сначала) → публикации о процедурах граждан за DGD_WINDOW дней →
-     страница каждой новой публикации в невидимой рамке → ссылки на файлы → файлы в папку региона → ИИН */
+  /* Дерево «Деятельность» департамента на gov.kz. У кого раздел «Восстановление платежеспособности и банкротство граждан…»,
+     у кого он внутри «Реабилитация и банкротство» › «Физические лица»; дальше год, «Информационные сообщения», объявления.
+     Файлы лежат на любом уровне: документом в разделе (у документа файл) или ссылкой прямо в тексте раздела (/uploads/…).
+     Обход: ветки этого года и без года, о гражданах; юрлица и другие годы пропускаются. */
+  const GOV_ROOT_RE = rx('банкрот|платеж|оңалту|төлем\\s+қабілет');
+  const GOV_ROOT_CITIZEN_RE = rx('платежеспособ|граждан|физическ|азамат|төлем');
+  const GOV_CITIZEN_RE = rx('платежеспособ|граждан|физическ|физ\\.?\\s*лиц|азамат|төлем|информацион|хабарлама|объявлени|реестр|ртк');
+  const GOV_LEGAL_RE = rx('юридическ|заңды\\s+тұлға');
+  const UPLOAD_RE = /\/uploads\/\d{4}\/\d{1,2}\/\d{1,2}\/[^"'\s<>\\)]+\.(?:xlsx|xlsm|xls|docx|doc|pdf|jpe?g|png|zip|rar|csv)/gi;
+  async function govTreeDocs(s, base, year) {
+    const r = await relayFetch(base + '/activities/directions?lang=ru');
+    if (!r.ok) throw new Error('раздел «Деятельность» на gov.kz не открылся' + (r.status ? ' (код ' + r.status + ')' : r.error ? ': ' + r.error : ''));
+    const dirs = ((govData(decodeText(new Uint8Array(r.bytes))).getActivityDirections || {}).value || {}).directions || [];
+    const top = dirs.filter(d => !(d.parent_direction && d.parent_direction.id) && GOV_ROOT_RE.test(d.title || '') && !GOV_LEGAL_RE.test(d.title || ''));
+    const citizen = top.filter(d => GOV_ROOT_CITIZEN_RE.test(d.title || ''));
+    const roots = (citizen.length ? citizen : top).filter(d => { const y = (d.title || '').match(/20\d\d/g) || []; return !y.length || y.includes(year); });
+    const items = new Map(), seen = new Set(), nodes = [];
+    const visit = async (id, path, depth) => {
+      if (seen.has(String(id)) || depth > 6 || seen.size > 60 || s.skip) return;
+      seen.add(String(id));
+      tell(s.name + ': «Деятельность» › ' + path.map(x => x.slice(0, 45)).join(' › '));
+      const pg = await relayFetch(base + '/activities/' + id + '?lang=ru');
+      if (!pg.ok) return;
+      const d = govData(decodeText(new Uint8Array(pg.bytes)));
+      const art = (d.fetchArticleByDirection || {}).value || {};
+      const kids = ((d.getChildDirections || {}).value || {}).directions || [];
+      nodes.push({ id: String(id), path });
+      for (const x of art.documents || []) {
+        const key = 'doc:' + x.id;
+        if (!items.has(key)) items.set(key, { key, id: String(x.id), title: clean(x.title || ''), date: dayOf(x.date), path, doc: true });
+      }
+      const html = (art.article && art.article.content) || '';
+      for (const m of html.matchAll(UPLOAD_RE)) {                       /* файл ссылкой прямо в тексте раздела */
+        const url = GOV + m[0], key = 'file:' + m[0];
+        const near = clean(new DOMParser().parseFromString(html.slice(Math.max(0, m.index - 600), m.index), 'text/html').body.textContent || '').slice(-160);
+        if (!items.has(key)) items.set(key, { key, id: String(id), title: clean(art.title || path[path.length - 1]) + (near && near.length > 8 ? ' › ' + near.slice(-160) : ''), date: null, path, url });
+      }
+      for (const k of kids) {
+        const t = k.title || '', y = t.match(/20\d\d/g) || [];
+        if (y.length && !y.includes(year)) continue;
+        if (GOV_LEGAL_RE.test(t)) continue;
+        if (!(y.includes(year) || GOV_CITIZEN_RE.test(t) || GOV_CITIZEN_RE.test(path.join(' ')))) continue;
+        await visit(k.id, path.concat(t), depth + 1);
+      }
+    };
+    for (const root of roots) await visit(root.id, [root.title], 0);
+    return { roots: roots.map(x => x.title), nodes, items: Array.from(items.values()) };
+  }
+  /* Публикация о гражданине (не юрлице) */
+  const annCitizen = t => ANN_TITLE_RE.test(t) && !GOV_NOT_RE.test(t) && (/платежеспособ|граждан|судебн\S*\s+банкрот|физ|төлем|азамат/i.test(t));
+  /* ИИН прямо в названии: «Реестр требований кредиторов … по должнику: ФИО, ИИН 000000000000» */
+  function titleIins(t) {
+    const out = [];
+    for (const m of String(t || '').matchAll(/(?<!\d)(\d{12})(?!\d)/g)) if (iinOk(m[1]) && personalIin(m[1]) && !out.includes(m[1])) out.push(m[1]);
+    return out;
+  }
+  /* Адреса файлов документа: открытый справочник gov.kz (content-manager) отдаёт документ с путями файлов /uploads/… */
+  async function govDocFiles(base, slug, id) {
+    const r = await relayFetch(GOV + '/api/v1/public/content-manager/documents?id=eq:' + encodeURIComponent(id) + '&projects=eq:' + encodeURIComponent(slug), 60000);
+    const out = [];
+    if (r.ok && r.bytes) for (const m of decodeText(new Uint8Array(r.bytes)).matchAll(UPLOAD_RE)) { const u = GOV + m[0]; if (!out.includes(u)) out.push(u); }
+    return out;
+  }
+  /* Один регион: все публикации о гражданах этого года в «Деятельности» (запасной путь: поиск в «Документах»),
+     ИИН из названий, файлы (таблицы объявлений, реестры требований, приказы) в папку региона. Адрес файла на gov.kz
+     содержит отпечаток содержимого: тот же адрес, тот же файл, его не нужно скачивать снова; изменённый файл получает
+     новый адрес и скачивается. */
   async function harvestGov(s) {
-    const base = GOV + '/org/' + s.slug;
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    const since = new Date(today); since.setDate(since.getDate() - DGD_WINDOW);
+    const base = GOV + '/org/' + s.slug, year = String(new Date().getFullYear());
     const dir = await regionDirOf(s.name);
     const old = (await readJsonFile(dir, DGD_META)) || { rows: [] };
-    const before = new Map((old.rows || []).map(r => [r.key, r]));
-    const list = [], pages = [];
-    for (let page = 1; page <= GOV_PAGES; page++) {
-      if (s.skip) throw new Error('пропущен');
-      tell(s.name + ': список документов, страница ' + page);
-      const url = base + '/documents/' + page + '?lang=ru&size=50';
-      const r = await relayFetch(url);
-      if (!r.ok) {
-        if (page === 1) throw new Error('раздел «Документы» на gov.kz не открылся' + (r.status ? ' (код ' + r.status + ')' : r.error ? ': ' + r.error : ''));
-        break;
-      }
-      const fd = (govData(decodeText(new Uint8Array(r.bytes))).getFilteredData || {}).value;
-      if (!fd || !Array.isArray(fd.data)) { if (page === 1) throw new Error('в разделе «Документы» на gov.kz нет списка'); break; }
-      pages.push({ url, read: true, rows: fd.data.length });
-      for (const x of fd.data) list.push({ id: String(x.id), title: clean(x.title || ''), date: dayOf(x.created_date) });
-      const last = fd.data[fd.data.length - 1];
-      if (!fd.data.length || !last || (dayOf(last.created_date) || today) < since || page * 50 >= (+fd.count || 0)) break;
-    }
-    const mine = list.filter(x => isGovCitizenDoc(x.title));
-    const rows = [];
-    let got = 0, n = 0;
-    const fresh = mine.filter(x => x.date && x.date >= since);
-    for (const x of mine) {
-      const key = 'gov:' + x.id, was = before.get(key);
-      const row = { key, id: x.id, date: x.date, kind: govKind(x.title), debtor: govDebtor(x.title), manager: (orderInfo([x.title], []).manager || ''),
-        text: x.title, page: base + '/documents/details/' + x.id + '?lang=ru', firstSeen: was ? was.firstSeen : isoDay(new Date()), files: [], notes: [] };
-      rows.push(row);
-      const saved = was ? (was.files || []).filter(f => f.saved) : [];
-      const yearly = govYearly(x.title);
-      let ok = saved.length > 0 && !yearly;
-      for (const f of saved) { try { await dir.getFileHandle(f.saved); } catch (e) { ok = false; } }
-      if (ok) { row.files = saved; continue; }
-      if (!(x.date && x.date >= since) && !yearly) continue;               /* старше окна: только считается */
-      if (yearly) row.yearly = true;
-      if (s.skip) throw new Error('пропущен');
-      n++;
-      s.note = 'публикация ' + n + ' из ' + fresh.length;
-      showCollect();
-      tell(s.name + ': публикация ' + n + ' из ' + fresh.length + ': ищу файл');
-      let links = [];
-      try {
-        const fr = await relayFrame(row.page, 25000);
-        links = (fr.links || []).map(l => l.href);
-        if (!links.length) {                                            /* ссылки нет: адрес файла в ответах сайта странице */
-          for (const api of (fr.resources || []).filter(u => !/\.(js|css|svg|png|woff2?)(\?|$)/i.test(u)).slice(0, 8)) {
-            const j = await relayFetch(api, 30000);
-            if (!j.ok || !j.bytes) continue;
-            for (const mm of decodeText(new Uint8Array(j.bytes)).matchAll(/\/(?:uploads|api\/v1\/public\/assets|api\/v2\/(?:public\/)?files)\/[^"'\s\\<>]+/g)) links.push(GOV + mm[0]);
+    const savedBefore = new Map();
+    for (const r of old.rows || []) for (const f of r.files || []) if (f.saved && f.url) savedBefore.set(f.url, f.saved);
+    const firstSeen = new Map((old.rows || []).map(r => [r.key, r.firstSeen]));
+    const tree = await govTreeDocs(s, base, year);
+    if (s.skip) throw new Error('пропущен');
+    let via = 'Деятельность';
+    let items = tree.items.filter(x => !GOV_NOT_RE.test(x.title) || titleIins(x.title).length);
+    if (!items.some(x => ANN_TITLE_RE.test(x.title))) {                /* запасной путь: поиск объявлений в «Документах» */
+      for (const q of ['возбуждении производства', 'возбуждении']) {
+        tell(s.name + ': в «Деятельности» объявления нет, ищу в «Документах»: «' + q + '»');
+        const r = await relayFetch(base + '/documents/1?lang=ru&size=50&title=' + encodeURIComponent(q));
+        const fd = r.ok ? (govData(decodeText(new Uint8Array(r.bytes))).getFilteredData || {}).value : null;
+        let added = 0;
+        for (const x of (fd && fd.data) || []) {
+          const t = clean(x.title || ''), d = dayOf(x.created_date);
+          if (annCitizen(t) && ((d && String(d.getFullYear()) === year) || t.includes(year)) && !items.some(y => y.key === 'doc:' + x.id)) {
+            items.push({ key: 'doc:' + x.id, id: String(x.id), title: t, date: d, path: ['Документы'], doc: true, found: 'Документы (поиск)' });
+            added++;
           }
         }
-        if (!links.length && fr.text) row.notes.push('на странице нет файла' + (/mainFileNotExist|не найден/i.test(fr.text) ? ' (сайт пишет, что файла нет)' : ''));
-      } catch (e) { row.notes.push('страница публикации не открылась: ' + e.message); }
-      links = Array.from(new Set(links)).filter(u => !/\.(svg|png|jpe?g)$/i.test(u) || /original/i.test(u)).slice(0, 3);
-      for (const href of links) {
+        if (added) { via = tree.items.length ? 'Деятельность + Документы (поиск)' : 'Документы (поиск)'; break; }
+      }
+    }
+    const rows = [];
+    let got = 0, n = 0;
+    for (const x of items) {
+      if (s.skip) throw new Error('пропущен');
+      const row = { key: x.key, id: x.id, date: x.date, kind: govKind(x.title), debtor: govDebtor(x.title), manager: '', text: x.title,
+        page: x.doc ? base + '/documents/details/' + x.id + '?lang=ru' : base + '/activities/' + x.id + '?lang=ru', firstSeen: firstSeen.get(x.key) || isoDay(new Date()),
+        files: [], notes: [], path: x.path.join(' › '), via: x.found || 'Деятельность', titleIins: titleIins(x.title) };
+      rows.push(row);
+      n++;
+      s.note = 'публикация ' + n + ' из ' + items.length;
+      if (n % 5 === 1) showCollect();
+      let urls = x.url ? [x.url] : [];
+      if (x.doc) {
+        try { urls = await govDocFiles(base, s.slug, x.id); } catch (e) { row.notes.push('файл документа не найден: ' + e.message); }
+        if (!urls.length) row.notes.push('у публикации нет файла');
+      }
+      for (const href of urls.slice(0, 4)) {
+        const was = savedBefore.get(href);
+        if (was) { try { await dir.getFileHandle(was); row.files.push({ url: href, name: was, saved: was, err: '' }); continue; } catch (e) { /* файл удалили: скачать снова */ } }
+        if (row.titleIins.length && !ANN_TITLE_RE.test(x.title)) { row.files.push({ url: href, name: '', saved: '', err: '' }); continue; }   /* ИИН уже в названии */
+        tell(s.name + ': скачиваю файл публикации ' + n + ' из ' + items.length);
         let r;
-        try { r = await relayFetch(href, 180000); } catch (e) { row.files.push({ url: href, name: '', saved: '', err: e.message }); continue; }
+        try {
+          r = await relayFetch(href, 180000);
+          for (let k = 1; k <= 2 && !r.ok && (!r.status || r.status >= 500) && !s.skip; k++) {   /* сайт занят (503) или обрыв: пауза и ещё раз */
+            tell(s.name + ': файл не скачался' + (r.status ? ' (код ' + r.status + ')' : '') + ', повтор через ' + 8 * k + ' с');
+            await sleep(8000 * k);
+            r = await relayFetch(href, 180000);
+          }
+        } catch (e) { row.files.push({ url: href, name: '', saved: '', err: e.message }); continue; }
         if (!r.ok || !r.bytes || !r.bytes.byteLength) { row.files.push({ url: href, name: '', saved: '', err: 'файл не скачался' + (r.status ? ' (код ' + r.status + ')' : '') }); continue; }
         const bytes = new Uint8Array(r.bytes);
-        let fname = '';
-        const disp = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(r.disposition || '');
-        if (disp) { try { fname = decodeURIComponent(disp[1] || disp[2]); } catch (e) { fname = disp[1] || disp[2]; } }
-        if (!fname) fname = decodeURIComponent(href.split('?')[0].split('/').pop() || '');
-        const ext = (/\.([a-z0-9]{2,4})$/i.exec(fname) || [])[1] || (/pdf/i.test(r.type) ? 'pdf' : /png/i.test(r.type) ? 'png' : /jpe?g/i.test(r.type) ? 'jpg'
-          : /wordprocessing|msword/i.test(r.type) ? 'docx' : /sheet|excel/i.test(r.type) ? 'xlsx' : 'pdf');
-        const name = orderFileName(row, { name: fname.replace(/\.[a-z0-9]{2,4}$/i, '') + '.' + ext }, r.type);
-        try { await writeFile(dir, name, bytes); } catch (e) { row.files.push({ url: href, name: fname, saved: '', err: 'не записан: ' + e.message }); continue; }
-        row.files.push({ url: href, name: fname, saved: name, err: '' });
+        const ext = ((/\.([a-z0-9]{2,4})$/i.exec(href) || [])[1] || 'bin').toLowerCase();
+        const name = (isoDay(x.date) || year) + '_' + (safeName(row.debtor).slice(0, 40) || safeName(x.title).slice(0, 60) || 'публикация') + '_' + href.split('/').pop().slice(0, 10) + '.' + ext;
+        try { await writeFile(dir, name, bytes); } catch (e) { row.files.push({ url: href, name: '', saved: '', err: 'не записан: ' + e.message }); continue; }
+        row.files.push({ url: href, name, saved: name, err: '' });
         got++;
-        queueOcr(regionFolder(s.name) + '/' + name, bytes, name, r.type);
+        if (/^(pdf|jpe?g|png)$/.test(ext)) queueOcr(regionFolder(s.name) + '/' + name, bytes, name, r.type);
+        await sleep(100);
       }
-      await sleep(150);
     }
     const meta = {
-      version: VERSION, source: 'gov.kz', region: s.name, slug: s.slug, state: 'ok', note: '', collectedAt: new Date().toISOString(), window: DGD_WINDOW,
-      pages: pages.map(p => ({ url: p.url, title: 'Документы ' + s.slug, year: null, rows: p.rows, read: p.read, err: '' })),
-      rows: rows.map(r => ({ key: r.key, id: r.id, date: isoDay(r.date), dateFrom: r.yearly ? 'сводная за год, перечитана ' + dmy(new Date()) : '', kind: r.kind, debtor: r.debtor, manager: r.manager, number: '',
-        text: r.text, page: r.page, future: false, firstSeen: r.firstSeen, notes: r.notes,
+      version: VERSION, source: 'gov.kz', region: s.name, slug: s.slug, state: 'ok', note: '', collectedAt: new Date().toISOString(), year,
+      via: items.length ? via : '', roots: tree.roots, nodes: tree.nodes.length,
+      pages: [{ url: base + '/activities/directions?lang=ru', title: 'Деятельность', year: +year, rows: items.length, read: true, err: '' }],
+      rows: rows.map(r => ({ key: r.key, id: r.id, date: isoDay(r.date), dateFrom: '', kind: r.kind, debtor: r.debtor, manager: '', number: '',
+        text: r.text, page: r.page, future: false, firstSeen: r.firstSeen, notes: r.notes, path: r.path, via: r.via, titleIins: r.titleIins,
         files: r.files.map(f => ({ url: f.url, name: f.name || '', gov: false, saved: f.saved || '', err: f.err || '' })) })),
     };
     await writeJsonFile(dir, DGD_META, meta);
-    s.note = 'публикаций за ' + DGD_WINDOW + ' дн. ' + fresh.length + ', новых файлов ' + got;
+    const anns = rows.filter(r => ANN_TITLE_RE.test(r.text)).length;
+    s.note = items.length ? 'публикаций ' + items.length + ' (объявлений о возбуждении ' + anns + '), новых файлов ' + got + (via !== 'Деятельность' ? ', ' + via : '')
+      : 'публикаций о гражданах за ' + year + ' год не найдено';
     const left = collect ? collect.sites.filter(x => x.state === 'wait').length : 0;
     tell(s.name + ': готово (' + s.note + ').' + (left ? ' Дальше: ещё ' + left + ' регион(ов).' : ' Это был последний регион: вкладку можно закрыть.'));
   }
@@ -3667,15 +4032,16 @@
     test: { normIin, checkDigit, openBook, loadSheet, readTasks, ensureColumns, setText, setLink, setPathLink, linkStyle, bookBytes, zipRead,
       useDir, openBytes, run, timings, normBase, baseValid, folderRoom, go, buildSvg, drawSvg,
       setRegs: keys => { for (const [k, box] of regChecks) box.checked = keys.includes(k); refresh(); },
-      describe, recordInfo, readRecords, makeXlsx, parseCsv, decodeText, pdfLines, fileRows, extractIins, regionsIn, readDgd, dgdWorkbook,
-      readScan, readOrderFile, ocrIins, grayOf, ocrPlausible, orderInfo, samePerson, GOV_SITES, govData, govKind, govDebtor, GOV_DOC_RE, GOV_NOT_RE, isGovCitizenDoc, govYearly,
+      describe, recordInfo, readRecords, makeXlsx, parseCsv, decodeText, pdfLines, fileRows, xlsRows, extractIins, regionsIn, readDgd, dgdWorkbook,
+      readScan, readOrderFile, ocrIins, grayOf, ocrPlausible, orderInfo, samePerson, GOV_SITES, govData, govKind, govDebtor, GOV_DOC_RE, GOV_NOT_RE, isGovCitizenDoc, govYearly, parseAnnouncements,
       collecting: () => collect && { sites: collect.sites.map(x => ({ key: x.key, name: x.name, state: x.state, note: x.note })), ocrLeft: collect.ocrLeft, finishing: !!collect.finishing },
       relayFetch: url => relayFetch(url, 15000),
       learnPage: async (bytes, name) => { const c = await window.__tazalau.test.debugPage(bytes, name); const dbg = []; dbg.learn = []; if (c) ocrIins(grayOf(c), dbg); return dbg.learn; },
       debugPage: async (bytes, name) => { if (/\.pdf$/i.test(name)) { const doc = await pdfOpen(bytes); return pdfPageImage(doc, doc.pages[0], OCR_DPI); } return imageFileCanvas(bytes, 'image/jpeg'); },
       state: () => ({ running, journal, tasks: tasks.length, sheet: S && S.sheet.name, layout: S && S.layout, base: baseState().base, baseAuto,
         dgd: dgd === 'reading' ? 'reading' : dgd && { files: dgd.files.length, iins: dgd.byIin.size, orders: (dgd.orders || []).length,
-          regions: dgd.regions.map(r => ({ name: r.name, level: r.level, text: r.text, unique: r.unique, win: r.win, year: r.year, read: r.read, unread: r.unread })) } }) },
+          regions: dgd.regions.map(r => ({ name: r.name, level: r.level, text: r.text, unique: r.unique, win: r.win, year: r.year, read: r.read, unread: r.unread,
+            annRows: r.annRows || 0, annUnique: r.annUnique || 0, annPosted: r.annPosted ? isoDay(r.annPosted) : '' })) } }) },
   };
   layoutFrame();
   lastRequest = Date.now();           /* первая страница в рамке тоже запрос: следующий пойдёт не раньше, чем через паузу */

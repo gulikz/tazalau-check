@@ -249,6 +249,43 @@ def turbo(root):
     return json.dumps(vals, ensure_ascii=False)
 
 
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+ANN_HEAD_RU = ["№", "ФИО должника", "ИИН должника", "Адрес должника", "Наименование суда", "Дата вынесения определения о возбуждении дела",
+               "ФИО финансового управляющего", "Срок приема требований кредиторов", None, "Адрес приема требований", "Контактные данные",
+               "Дата размещения объявления"]
+ANN_HEAD_KZ = ["№", "Борышкердің тегі, аты, әкесінің аты", "Борышкердің жеке сәйкестендіру нөмірі", "Борышкердің мекен жайы",
+               "Іс жүргізуді қозғау туралы ұйғарым шығарған соттың атауы", "Ұйғарымның шығарылған күні", "Қаржылық басқарушының тегі, аты, әкесінің аты",
+               "Кредиторлар талаптарын қабылдау мерзімі", None, "Талаптарды қабылдау мекенжайы", "Қаржылық басқарушының байланыс деректері",
+               "Хабарландыруды орналастыру күні"]
+
+
+def ann_table(rows, kazakh_copy=False):
+    """Таблица «Объявление о возбуждении производства…» как на gov.kz: шапка в 4-й строке, «с / до», номера столбцов.
+    rows: [(ФИО, ИИН, дата определения, дата размещения, требования до)]. kazakh_copy: первый лист на казахском (как у Астаны)."""
+    wb = Workbook()
+    sheets = []
+    if kazakh_copy:
+        kz = wb.active
+        kz.title = "ВП (гос.яз)"
+        sheets.append((kz, ANN_HEAD_KZ, ["бастап", "дейін"]))
+        sheets.append((wb.create_sheet("ВП (рус.яз)"), ANN_HEAD_RU, ["с", "до"]))
+    else:
+        sheets.append((wb.active, ANN_HEAD_RU, ["с", "до"]))
+    for ws, head, sub in sheets:
+        ws.append(["Объявление о возбуждении производства по делу о применении процедуры восстановления платежеспособности"])
+        ws.append([])
+        ws.append([])
+        ws.append(head)
+        ws.append([None] * 7 + sub)
+        ws.append([str(i) for i in range(1, 13)])
+        for k, (fio, iin, ruling, posted, until) in enumerate(rows, start=1):
+            ws.append([k, fio, iin, "г. Тест, ул. Тестовая, 1", "СМЭС", ruling, "Управляющий Тест Т.", posted, until, "г. Тест, ул. Приёмная, 2",
+                       "8 700 000 00 00", posted])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 class GovSite:
     """Макет gov.kz для 20 департаментов ДГД: раздел «Документы» (данные в странице, как у настоящего сайта: turbo-stream),
     страница публикации, где ссылку на файл достраивает скрипт страницы (как у настоящего сайта), файлы /uploads/.
@@ -258,22 +295,33 @@ class GovSite:
 
     def __init__(self, now):
         self.now = now
-        self.docs = {s: [] for s in self.SLUGS}     # slug -> [{id, title, date, file: (path, bytes, type) | None, mode}]
+        self.docs = {s: [] for s in self.SLUGS}     # slug -> [{id, title, date, file: (path, bytes, type) | None, mode, in_tree}]
         self.down = set()
         self.calls = []
         self.next_id = 1100000
+        self.tree_off = set()       # у департамента нет раздела о банкротстве граждан в «Деятельности»
+        self.article = {}           # slug -> HTML текста раздела «<год> год» (ссылки /uploads/… прямо в тексте)
+        self.extra_files = {}       # /uploads/… -> (bytes, type): файлы, на которые ссылается текст раздела
+        self.nodes_seen = []        # (slug, id раздела), которые открывал помощник
 
     def day(self, n):
         return (self.now - datetime.timedelta(days=n)).strftime("%d.%m.%Y")
 
-    def add(self, slug, title, ago, data=None, ctype="application/pdf", mode="link"):
+    def add(self, slug, title, ago, data=None, ctype="application/pdf", mode="link", in_tree=True):
         self.next_id += 1
-        ext = {"application/pdf": "pdf", "image/jpeg": "jpg",
+        ext = {"application/pdf": "pdf", "image/jpeg": "jpg", XLSX_TYPE: "xlsx",
                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx"}.get(ctype, "bin")
         path = f"/uploads/2026/11/{self.next_id % 28 + 1}/{self.next_id:x}abc_original.{len(data or b'')}.{ext}" if data else None
         self.docs[slug].append({"id": self.next_id, "title": title, "date": self.now - datetime.timedelta(days=ago, hours=1),
-                                "file": (path, data, ctype) if data else None, "mode": mode})
+                                "file": (path, data, ctype) if data else None, "mode": mode, "in_tree": in_tree})
         return self.next_id
+
+    def link_in_text(self, slug, text, data, ctype=None):
+        """Файл ссылкой прямо в тексте раздела «<год> год» (так у Павлодара)."""
+        self.next_id += 1
+        path = f"/uploads/2026/11/5/{self.next_id:x}def_original.{len(data)}.xlsx"
+        self.extra_files[path] = (data, ctype or XLSX_TYPE)
+        self.article[slug] = self.article.get(slug, "") + f'<p>{html.escape(text)}</p><p><a href="{path}">Скачать</a></p>'
 
     def page(self, queries, extra=""):
         line = turbo({"loaderData": {"document-detail": {"critical": {"publicQueries": queries}}}}) + "\n"
@@ -295,7 +343,8 @@ class GovSite:
             if slug in self.down:
                 return route.abort("timedout")
             size = int((q.get("size") or ["10"])[0])
-            docs = sorted(self.docs[slug], key=lambda d: -d["date"].timestamp())
+            want = (q.get("title") or [""])[0].lower()                 # поиск по названию в «Документах»
+            docs = sorted([d for d in self.docs[slug] if want in d["title"].lower()], key=lambda d: -d["date"].timestamp())
             part = docs[(n - 1) * size: n * size]
             data = [{"id": d["id"], "projects": slug, "title": d["title"], "created_date": d["date"].strftime("%Y-%m-%dT%H:%M:%SZ"),
                      "type": {"content_type_slug": "document_type", "items": [{"id": 3, "type": "Информация"}]}} for d in part]
@@ -324,6 +373,42 @@ class GovSite:
             doc = next((d for ds in self.docs.values() for d in ds if str(d["id"]) == (q.get("ids") or [""])[0]), None)
             body = json.dumps([{"id": doc["id"] * 7, "path": doc["file"][0]}] if doc and doc["file"] else [])
             return route.fulfill(headers={"content-type": "application/json"}, body=body)
+        m = re.match(r"^/org/([a-z-]+)/activities/directions$", path)
+        if m and m.group(1) in self.docs:
+            slug = m.group(1)
+            if slug in self.down:
+                return route.abort("timedout")
+            dirs = [{"id": 900, "title": "Налоговое администрирование", "parent_direction": None},
+                    {"id": 901, "title": "Реабилитация и банкротство юридических лиц", "parent_direction": None}]
+            if slug not in self.tree_off:
+                dirs.append({"id": 10, "title": "Восстановление платежеспособности и банкротство граждан Республики Казахстан", "parent_direction": None})
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page([
+                {"endpointName": "getActivityDirections", "arg": {"slug": slug}, "value": {"directions": dirs}}]))
+        m = re.match(r"^/org/([a-z-]+)/activities/(\d+)$", path)
+        if m and m.group(1) in self.docs:
+            slug, node, y = m.group(1), int(m.group(2)), self.now.year
+            self.nodes_seen.append((slug, node))
+            kids, docs, content = [], [], ""
+            if node == 10:
+                kids = [{"id": 20, "title": f"{y} год"}, {"id": 21, "title": f"{y - 1} год"}]
+            elif node == 20:
+                kids = [{"id": 30, "title": f"{y} год. Восстановление платежеспособности и банкротство физических лиц. Информационные сообщения"}]
+                content = self.article.get(slug, "")
+            elif node == 30:
+                docs = [{"id": d["id"], "title": d["title"], "date": d["date"].astimezone().isoformat()} for d in self.docs[slug] if d["in_tree"]]
+            elif node not in (21, 900, 901):
+                return route.fulfill(status=404, headers={"content-type": "text/html"}, body="<h1>404</h1>")
+            return route.fulfill(headers={"content-type": "text/html; charset=utf-8"}, body=self.page([
+                {"endpointName": "fetchArticleByDirection", "arg": {"id": node}, "value": {"title": "Раздел", "documents": docs, "article": {"content": content}}},
+                {"endpointName": "getChildDirections", "arg": {"id": node}, "value": {"directions": kids}}]))
+        if path == "/api/v1/public/content-manager/documents":       # открытый справочник: пути файлов документа
+            did, slug = (q.get("id") or [""])[0].replace("eq:", ""), (q.get("projects") or [""])[0].replace("eq:", "")
+            doc = next((d for d in self.docs.get(slug, []) if str(d["id"]) == did), None)
+            full = [{"document": doc["file"][0]}] if doc and doc["file"] and doc["mode"] != "none" else []
+            return route.fulfill(headers={"content-type": "application/json"}, body=json.dumps({"data": [{"id": did, "full_text": full}]}))
+        if path in self.extra_files:
+            data, ctype = self.extra_files[path]
+            return route.fulfill(status=200, headers={"content-type": ctype}, body=b"" if request.method == "HEAD" else data)
         if path.startswith("/uploads/"):
             f = next((d["file"] for ds in self.docs.values() for d in ds if d["file"] and d["file"][0] == path), None)
             if not f:
@@ -1199,10 +1284,11 @@ with sync_playwright() as p:
     summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
     reg, iins, files = summary["Регионы"], summary["ИИН"], summary["Файлы"]
     rows = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 15)] for r in range(2, reg.max_row + 1)}
-    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом", summary.sheetnames == ["Регионы", "Публикации", "ИИН", "Файлы"] and len(rows) == 21
+    expect("ДГД свод: лист «Регионы»: 21 строка, проверка с цветом",
+           summary.sheetnames == ["Регионы", f"Объявления {datetime.date.today().year}", "Публикации", "ИИН", "Файлы"] and len(rows) == 21
            and rows["Акмолинская обл."][1] == "нет списка" and reg.cell(list(rows).index("Акмолинская обл.") + 2, 2).fill.fgColor.rgb.endswith("FFC7CE")
            and rows["Павлодарская обл."][1] == "в порядке" and reg.cell(list(rows).index("Павлодарская обл.") + 2, 2).fill.fgColor.rgb.endswith("C6EFCE")
-           and rows["Павлодарская обл."][2] == "нет" and rows["Павлодарская обл."][11] == d0, rows.get("Павлодарская обл."))
+           and rows["Павлодарская обл."][2] == "нет" and rows["Павлодарская обл."][12] == d0, rows.get("Павлодарская обл."))
     got = {iins.cell(r, 1).value: [iins.cell(r, c).value for c in range(1, 9)] for r in range(2, iins.max_row + 1)}
     expect("ДГД свод: лист «ИИН»: ИИН текстом (ведущий ноль цел), ФИО, регион, управляющий, файл со ссылкой",
            got[C1][:5] == [C1, "Нулев Ноль", "г. Алматы", d0, "Петров Пётр Петрович"] and got[P1][1] == "Иванов Иван Иванович"
@@ -1256,10 +1342,13 @@ with sync_playwright() as p:
         seq = iter(range(100, 999))
         made = {}                                                     # ИИН -> (slug, ФИО)
 
-        def person(slug, title, fio, ago, kind="pdf", readable=True, mode="link", docx_text=False, text_layer=False):
+        def new_iin():
             n = next(seq)
             born = now - datetime.timedelta(days=365 * (30 + n % 25) + n)
-            iin = plausible(born.strftime("%y%m%d") + str(3 + n % 2))
+            return plausible(born.strftime("%y%m%d") + str(3 + n % 2)), n
+
+        def person(slug, title, fio, ago, kind="pdf", readable=True, mode="link", docx_text=False, text_layer=False):
+            iin, n = new_iin()
             if docx_text:
                 d = docx.Document(); d.add_paragraph(f"Объявление. Должник {fio}, ИИН {iin}. Финансовый управляющий Тестов Т.Т.")
                 buf = io.BytesIO(); d.save(buf); data, ctype = buf.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -1273,12 +1362,38 @@ with sync_playwright() as p:
                 made[iin] = (slug, fio)
             return iin
 
+        ANN_T = "Объявление о возбуждении производства по делу о применении процедуры восстановления платежеспособности и порядке заявления требований кредиторами"
+
+        def table(slug, people, ago, kazakh_copy=False, in_tree=True, link_text=None):
+            """Таблица объявлений: строка на должника (ИИН выдуманы; ФИО на «БЕЗИИН» — ячейка ИИН пустая)."""
+            rows, iins = [], []
+            for fio in people:
+                iin = "" if fio.startswith("БЕЗИИН") else new_iin()[0]
+                if iin:
+                    made[iin] = (slug, fio)
+                    iins.append(iin)
+                rows.append((fio, iin, gov.day(ago + 3), gov.day(ago), (now + datetime.timedelta(days=60)).strftime("%d.%m.%Y")))
+            data = ann_table(rows, kazakh_copy)
+            if link_text:
+                gov.link_in_text(slug, link_text, data)
+            else:
+                gov.add(slug, ANN_T, ago, data, XLSX_TYPE, in_tree=in_tree)
+            return iins
+
         ORDER = "Приказ о назначении финансового управляющего Тестов Т.Т. в отношении ФЛ {fio} от {day} г."
         RTK = "РТК должник {fio}"
         ANN = "Объявление о возбуждении производства по делу о применении процедуры судебного банкротства граждан РК {fio}"
+        M = table("kgd-mangistau", ["Мангыстаулы Марат", "Актауова Айым", "Жанаозенов Жан", "БЕЗИИНОВА БЕЛЛА"], 2)
+        table("kgd-astana", ["Астанов Аскар", "Есилова Ельвира"], 1, kazakh_copy=True)       # первый лист на казахском, второй — перевод
+        table("kgd-pavlodar", ["Павлодаров Пётр", "Иртышева Ирина", "Экибастузов Эрик"], 20)
+        table("kgd-zhambyl", ["Таразов Тимур", "Жамбылова Жанна", "Шуйский Шамиль"], 1,
+              link_text="Объявление о возбуждении производства по делу о восстановлении платежеспособности (таблица)")
+        table("kgd-sko", ["Северов Семён", "Петропавлова Полина", "Есильский Ерлан"], 3, in_tree=False)   # только поиском в «Документах»
+        person("kgd-sko", RTK, "СЕВЕРНЫЙ СЕРГЕЙ", 2)
+        gov.tree_off.add("kgd-akmola")                                                       # раздела нет и публикаций нет
         K1, K2 = person("kgd-kyzylorda", ORDER, "Кызылова Кайрата Ивановича", 1), person("kgd-kyzylorda", ORDER, "Сейтовой Алмы Ериковны", 2)
         K3 = person("kgd-kyzylorda", RTK, "ЖУМАБАЕВ НУРЛАН", 3)
-        person("kgd-kyzylorda", ORDER, "Старова Олега Петровича", 40)
+        person("kgd-kyzylorda", ORDER, "Старова Олега Петровича", 40)                         # за год: тоже берётся
         gov.add("kgd-kyzylorda", 'РТК ТОО "Тест Строй"', 1, b"%PDF-1.4 x", "application/pdf")
         gov.add("kgd-kyzylorda", "Список лиц, подлежащих назначению в качестве финансовых управляющих", 2, b"%PDF-1.4 x", "application/pdf")
         A1, A2 = person("kgd-almaty", RTK, "АХМЕТОВА АЙГЕРИМ", 1), person("kgd-almaty", RTK, "БОРИСОВА ВЕРА", 2, "jpg")
@@ -1286,25 +1401,25 @@ with sync_playwright() as p:
         D1 = person("kgd-almaty", ANN, "Гостева Галина", 4, docx_text=True)
         gov.down.add("kgd-atyrau")
         person("kgd-abay", ORDER, "Абаева Арнура", 2)
-        for f, a in [("Старого Семёна", 60), ("Старой Софии", 70)]:
-            person("kgd-akmola", ORDER, f, a)
-        for f, a in [("Павлова Петра", 20), ("Павловой Полины", 25)]:
-            person("kgd-pavlodar", ORDER, f, a)
         V1 = person("kgd-vko", ORDER, "Восточного Виктора", 1, text_layer=True)
         for f, a in [("Восточной Веры", 2), ("Восточнова Василия", 3)]:
             person("kgd-vko", ORDER, f, a)
         for f, a in [("Западного Захара", 1), ("Западной Зои", 2)]:
             person("kgd-zko", ORDER, f, a)
         gov.add("kgd-zko", ANN.format(fio="Безфайлова Бориса"), 3, None)
-        Q1 = person("kgd-kostanay", RTK, "КОСТИН КИРИЛЛ", 1, mode="api")
-        for f, a in [("ЛАВРОВА ЛИЯ", 4), ("МАРАТОВ МАРАТ", 6)]:
-            person("kgd-kostanay", RTK, f, a)
-        for slug in ["kgd-aktobe", "kgd-alm", "kgd-zhambyl", "kgd-zhetysu", "kgd-karaganda", "kgd-mangistau", "kgd-sko", "kgd-turkistan",
-                     "kgd-ulytau", "kgd-astana", "kgd-shymkent"]:
+        Q = []
+        for f, a in [("КОСТИН КИРИЛЛ", 1), ("ЛАВРОВА ЛИЯ", 4)]:                              # ИИН прямо в названии реестра
+            iin = new_iin()[0]
+            made[iin] = ("kgd-kostanay", f)
+            Q.append(iin)
+            gov.add("kgd-kostanay", f"Реестр требований кредиторов в процедуре восстановления платежеспособности по должнику: {f}, ИИН {iin}", a,
+                    b"%PDF-1.4 x", "application/pdf")
+        for slug in ["kgd-aktobe", "kgd-alm", "kgd-zhetysu", "kgd-karaganda", "kgd-turkistan", "kgd-ulytau", "kgd-shymkent"]:
             for i in range(3):
                 person(slug, ORDER, f"Тестова{slug[4:].capitalize()} Т{i}.Т.", 1 + i)
-        N1, X1 = plausible("8801014"), plausible("7702023")
-        work = fio_book("FIO", [("ПОСТОРОННИЙ ПЁТР ПЕТРОВИЧ", X1), ("НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА", N1), ("КЫЗЫЛОВ КАЙРАТ ИВАНОВИЧ", K1)])
+        N1, X1, X2 = plausible("8801014"), plausible("7702023"), plausible("6603035")
+        work = fio_book("FIO", [("ПОСТОРОННИЙ ПЁТР ПЕТРОВИЧ", X1), ("НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА", N1), ("КЫЗЫЛОВ КАЙРАТ ИВАНОВИЧ", K1),
+                                ("МАНГЫСТАУЛЫ МАРАТ", M[0]), ("БЕЗИИНОВА БЕЛЛА", X2)])
         site.calls.clear()
         site.found = {}
         page = open_helper(ctx, site, {"width": 1366, "height": 900})
@@ -1323,7 +1438,7 @@ with sync_playwright() as p:
                    "ничего не заполняйте: нажмите закладку" in page.inner_text("#tazalau-collect") and page.title().startswith("👉 Нажмите закладку Tazalau")
                    and tab.url.startswith("https://www.gov.kz/org/kgd-almaty?lang=ru#") and "/documents" not in tab.url, (tab.url, page.title()))
             ctx.new_cdp_session(tab).send("Page.navigate", {"url": HREF})        # одна закладка во вкладке gov.kz
-            tab.wait_for_function("() => /Связь с помощником есть|список документов|публикация \\d+ из|готово \\(/.test(document.body.innerText)", timeout=20000)
+            tab.wait_for_function("() => /Связь с помощником есть|«Деятельность»|публикация \\d+ из|готово \\(/.test(document.body.innerText)", timeout=20000)
             if stop_after:
                 page.wait_for_function("n => { const c = window.__tazalau.test.collecting(); return !c || c.sites.filter(x => x.state === 'done').length >= n; }",
                                        arg=stop_after, timeout=120000)
@@ -1336,61 +1451,89 @@ with sync_playwright() as p:
         said = page.evaluate(STATE)
         expect("сбор ДГД: все 20 регионов собраны с gov.kz по одному нажатию закладки, итог в окне", "ДГД собраны: 19 из 20" in said and tab.is_closed(), said)
         tree = opfs_tree(page, "gov")
-        kz = [k for k in tree if k.startswith("ДГД/Кызылординская область/") and not k.endswith(".json")]
-        expect("сбор ДГД: скачаны только публикации граждан за 31 день (Кызылорда: 3 из 6: без старой, ТОО и списка управляющих)", len(kz) == 3
-               and "ДГД/Кызылординская область/публикации_gov_kz.json" in tree, sorted(kz))
-        al = sorted(k for k in tree if k.startswith("ДГД/г. Алматы/") and not k.endswith(".json"))
+
+        def files_of(folder):
+            return sorted(k for k in tree if k.startswith("ДГД/" + folder + "/") and not k.endswith(".json"))
+
+        kz = files_of("Кызылординская область")
+        expect("сбор ДГД: публикации граждан за год (Кызылорда: 4 из 6, без ТОО и списка управляющих)", len(kz) == 4
+               and "ДГД/Кызылординская область/публикации_gov_kz.json" in tree, kz)
+        al = files_of("г. Алматы")
         expect("сбор ДГД: PDF, JPEG и Word скачаны", len(al) == 4 and sum(k.endswith(".jpg") for k in al) == 2 and sum(k.endswith(".docx") for k in al) == 1, al)
-        ks = [k for k in tree if k.startswith("ДГД/Костанайская область/") and not k.endswith(".json")]
-        expect("сбор ДГД: адрес файла найден в ответе сайта странице, когда ссылки на странице нет", len(ks) == 3, ks)
+        expect("сбор ДГД: ИИН в названии реестра требований: файл не скачивается", files_of("Костанайская область") == [], files_of("Костанайская область"))
+        expect("сбор ДГД: таблица ссылкой прямо в тексте раздела скачана (Жамбыл)", len(files_of("Жамбылская область")) == 1
+               and files_of("Жамбылская область")[0].endswith(".xlsx"), files_of("Жамбылская область"))
+        api = [c for c in gov.calls if c[1] == "/api/v1/public/content-manager/documents"]
+        odd = [x for x in gov.nodes_seen if x[1] in (21, 900, 901)]
+        expect("сбор ДГД: адреса файлов из открытого справочника gov.kz; прошлый год и юрлица в «Деятельности» не открываются",
+               len(api) >= 30 and not odd and ("kgd-mangistau", 30) in gov.nodes_seen, (len(api), odd[:3]))
         expect("сбор ДГД: распознанные ИИН запомнены в ДГД/распознано.json", "ДГД/распознано.json" in tree and K1 in tree["ДГД/распознано.json"].decode("utf-8"))
         regions = {r["name"]: r for r in page.evaluate("() => window.__tazalau.test.state().dgd.regions")}
-        want = {"Кызылординская обл.": ("good", "в порядке"), "Восточно-Казахстанская обл.": ("good", "в порядке"), "Костанайская обл.": ("good", "в порядке"),
-                "г. Алматы": ("warn", "ИИН не прочитан в публикациях: 1"), "Абайская обл.": ("warn", "всего 1 публикация за 31 дн."),
-                "Акмолинская обл.": ("bad", "0 публикаций за 31 дн."), "Павлодарская обл.": ("warn", "всего 2 публикации за 31 дн."),
-                "Атырауская обл.": ("bad", "раздел «Документы» на gov.kz не открылся"), "Западно-Казахстанская обл.": ("warn", "без файла: 1")}
+        y = str(now.year)
+        want = {"Мангистауская обл.": ("good", "в порядке"), "Жамбылская обл.": ("good", "в порядке"), "Северо-Казахстанская обл.": ("good", "в порядке"),
+                "г. Астана": ("warn", "всего 2 ИИН в объявлениях: проверить на gov.kz"),
+                "Павлодарская обл.": ("warn", "последнее объявление размещено " + gov.day(20) + ": 20 дн. назад"),
+                "Кызылординская обл.": ("warn", "объявления о возбуждении дел за " + y + " год нет (есть другие публикации: 4)"),
+                "г. Алматы": ("warn", "всего 1 ИИН в объявлениях"), "Абайская обл.": ("warn", "(есть другие публикации: 1)"),
+                "Акмолинская обл.": ("bad", "публикаций о гражданах за " + y + " год на gov.kz не найдено"),
+                "Атырауская обл.": ("bad", "раздел «Деятельность» на gov.kz не открылся"),
+                "Западно-Казахстанская обл.": ("bad", "в объявлениях о возбуждении дел 0 строк")}
         for name, (level, text) in want.items():
             r = regions[name]
             expect(f"сбор ДГД: проверка региона: {name}: {text}", r["level"] == level and text in r["text"], r)
-        expect("сбор ДГД: свежесть: последняя публикация 20 дн. назад отмечена", "последняя публикация " + gov.day(20) + ": 20 дн. назад" in regions["Павлодарская обл."]["text"],
-               regions["Павлодарская обл."])
+        expect("сбор ДГД: таблица на двух языках (Астана: казахский лист и перевод) считается один раз",
+               regions["г. Астана"]["annRows"] == 2 and regions["г. Астана"]["annUnique"] == 2, regions["г. Астана"])
+        expect("сбор ДГД: г. Алматы: скан без читаемого ИИН отмечен", "ИИН не прочитан в файлах: 1" in regions["г. Алматы"]["text"], regions["г. Алматы"])
+        expect("сбор ДГД: ЗКО: объявление без файла отмечено", "без файла и без ИИН в названии: 1" in regions["Западно-Казахстанская обл."]["text"],
+               regions["Западно-Казахстанская обл."])
         summary = load_workbook(io.BytesIO(tree["ДГД_свод.xlsx"]))
+        ann_ws = summary[f"Объявления {y}"]
+        ann_rows = [[ann_ws.cell(r, c).value for c in range(1, 16)] for r in range(2, ann_ws.max_row + 1)]
+        expect("сбор ДГД: свод, лист «Объявления»: таблицы всех регионов одной таблицей (Астана один раз), ИИН текстом, ссылки на публикацию и файл",
+               len(ann_rows) == 4 + 2 + 3 + 3 + 3 and sum(1 for r in ann_rows if r[0] == "г. Астана") == 2
+               and {r[3] for r in ann_rows if r[0] == "Мангистауская обл."} == set(M) | {"нет ИИН"}
+               and ann_ws.cell(2, 14).hyperlink is not None and ann_ws.cell(2, 15).hyperlink is not None, ann_rows[:2])
         pubs = summary["Публикации"]
         got = {}
         for r in range(2, pubs.max_row + 1):
-            for iin in str(pubs.cell(r, 6).value or "").split(", "):
+            for iin in str(pubs.cell(r, 5).value or "").split(", "):
                 got[iin] = [pubs.cell(r, c).value for c in range(1, 12)] + [pubs.cell(r, 8).hyperlink, pubs.cell(r, 9).hyperlink]
-        expect("сбор ДГД: свод, лист «Публикации»: регион, дата, вид, должник, управляющий, ИИН, как прочитан, файл и публикация со ссылками",
+        expect("сбор ДГД: свод, лист «Публикации»: регион, дата, вид, должник, ИИН, как прочитан, файл и публикация со ссылками",
                got.get(K1, [None])[0] == "Кызылординская обл." and got[K1][1] == gov.day(1) and got[K1][2] == "приказ (назначение)"
-               and got[K1][3] == "Кызылова Кайрата Ивановича" and got[K1][4] == "Тестов Т.Т." and got[K1][6] == "распознано со скана"
+               and got[K1][3] == "Кызылова Кайрата Ивановича" and got[K1][5] == "распознано со скана"
                and got[K1][11] is not None and "gov.kz/org/kgd-kyzylorda/documents/details/" in str(got[K1][12].target)
                and got.get(K3, [None] * 4)[2] == "реестр требований кредиторов" and got[K3][3] == "ЖУМАБАЕВ НУРЛАН"
-               and got.get(V1, [None] * 7)[6] == "текст PDF" and got.get(D1, [None] * 7)[6] == "текст файла"
-               and str(got.get(D1, [None] * 3)[2]).startswith("объявление о возбуждении дела, судебное банкротство"), (got.get(K1), got.get(K3), got.get(D1)))
-        wrong = [i for i in got if i and i.isdigit() and i not in made]
+               and got.get(V1, [None] * 6)[5] == "текст PDF" and got.get(D1, [None] * 6)[5] == "текст файла"
+               and str(got.get(D1, [None] * 3)[2]).startswith("объявление о возбуждении дела, судебное банкротство")
+               and got.get(Q[0], [None] * 6)[5] == "название публикации", (got.get(K1), got.get(K3), got.get(D1), got.get(Q[0])))
+        seen = set(got) | {r[3] for r in ann_rows}
+        wrong = [i for i in seen if i and str(i).isdigit() and i not in made]
         expect("сбор ДГД: ни одного чужого ИИН", not wrong, wrong)
-        old_ok = {i for i, (sl, f) in made.items() if sl in ("kgd-akmola", "kgd-pavlodar") or f in ("Старова Олега Петровича",)}
-        missed = [made[i] for i in made if i not in got and i not in old_ok]
-        expect("сбор ДГД: все читаемые публикации за 31 день прочитаны (скан PDF, JPEG, текст PDF, Word)", not missed, missed)
+        missed = [made[i] for i in made if i not in seen]
+        expect("сбор ДГД: все читаемые публикации за год прочитаны (таблицы, скан PDF, JPEG, текст PDF, Word, ИИН в названии)", not missed, missed)
         reg = summary["Регионы"]
         row = {reg.cell(r, 1).value: [reg.cell(r, c).value for c in range(1, 15)] for r in range(2, reg.max_row + 1)}
-        expect("сбор ДГД: свод, лист «Регионы»: сбор, последняя публикация, публикаций за 31 день, прочитано, раздел на gov.kz",
-               row["Кызылординская обл."][2] == now.strftime("%d.%m.%Y") and row["Кызылординская обл."][3] == gov.day(1)
-               and row["Кызылординская обл."][4] == "3" and row["Кызылординская обл."][6] == "3"
-               and str(row["Кызылординская обл."][12]) == "https://www.gov.kz/org/kgd-kyzylorda/documents/1?lang=ru"
-               and str(row["Атырауская обл."][2]).startswith("не открылся"), row["Кызылординская обл."])
+        mg = row["Мангистауская обл."]
+        expect("сбор ДГД: свод, лист «Регионы»: сбор, где на gov.kz, объявлений, строк, ИИН, последнее размещение",
+               mg[2] == now.strftime("%d.%m.%Y") and "Информационные сообщения" in str(mg[3]) and mg[4:8] == ["1", "4", "3", gov.day(2)]
+               and str(row["Северо-Казахстанская обл."][3]) == "Документы" and str(row["Атырауская обл."][2]).startswith("не открылся"),
+               (mg, row["Северо-Казахстанская обл."][3], row["Атырауская обл."][2]))
         final = run_and_wait(page)
         tree = opfs_tree(page, "gov")
-        expect("сбор ДГД: ИИН из публикаций ДГД проверяются на tazalau первыми", [c[1] for c in site.calls][:1] == [K1], site.calls[:3])
+        expect("сбор ДГД: ИИН из публикаций ДГД проверяются на tazalau первыми", [c[1] for c in site.calls][:1] in ([K1], [M[0]]), site.calls[:3])
         ws = load_workbook(io.BytesIO(tree["ADW.xlsx"]))["ИИН"]
         col = [ws.cell(1, c).value for c in range(1, 12)].index("ДГД") + 1
-        vals = {ws.cell(r, 2).value: (ws.cell(r, col).value, ws.cell(r, col).hyperlink) for r in range(2, 5)}
-        expect("сбор ДГД: в рабочем файле столбец «ДГД»: регион, вид и дата публикации, управляющий, ссылка на файл",
-               str(vals[K1][0]).startswith(f"Кызылординская обл., приказ (назначение) от {gov.day(1)}, управляющий: Тестов Т.Т.") and vals[K1][1] is not None
-               and vals[X1][0] in (None, ""), vals)
+        vals = {ws.cell(r, 2).value: (ws.cell(r, col).value, ws.cell(r, col).hyperlink) for r in range(2, 7)}
+        expect("сбор ДГД: в рабочем файле столбец «ДГД»: регион, вид и дата публикации, ссылка на файл",
+               str(vals[K1][0]).startswith(f"Кызылординская обл., приказ (назначение) от {gov.day(1)}") and vals[K1][1] is not None
+               and str(vals[M[0]][0]).startswith(f"Мангистауская обл., объявление о возбуждении дела, определение суда от {gov.day(5)}, размещено {gov.day(2)}")
+               and vals[M[0]][1] is not None and vals[X1][0] in (None, ""), vals)
         expect("сбор ДГД: публикация без прочитанного ИИН сверена по ФИО: «возможно» со ссылкой на файл",
                str(vals[N1][0]).startswith("⚠ возможно (по ФИО, ИИН в файле не прочитан): г. Алматы, «НЕЧИТАЕМОВА НИНА НИКОЛАЕВНА»") and vals[N1][1] is not None,
                vals[N1])
+        expect("сбор ДГД: строка таблицы объявлений без ИИН сверена по ФИО",
+               str(vals[X2][0]).startswith("⚠ возможно (по ФИО, ИИН в файле не прочитан): Мангистауская обл., «БЕЗИИНОВА БЕЛЛА», объявление о возбуждении дела")
+               and vals[X2][1] is not None, vals[X2])
         before = len([c for c in gov.calls if c[1].startswith("/uploads/")])
         collect_all(stop_after=2)
         after = len([c for c in gov.calls if c[1].startswith("/uploads/")])
